@@ -70,13 +70,14 @@ else
   echo "警告: 无法校验文件完整性（缺少 sha256sum 或 SHA256SUMS）" >&2
 fi
 
-mkdir -p -m 0755 "$(dirname "$BIN")"
+mkdir -p "$(dirname "$BIN")"
+chmod 755 "$(dirname "$BIN")"
 install -m 0755 "$TMP/$NAME" "$BIN.new"
 mv -f "$BIN.new" "$BIN"
 
 umask 077
 mkdir -p "$ENV_DIR"
-chmod 700 "$ENV_DIR"
+chmod 755 "$ENV_DIR"
 cat > "$ENV_FILE" <<EOT
 CFSM_URL=$URL
 CFSM_ID=$ID
