@@ -70,6 +70,7 @@ else
   echo "警告: 无法校验文件完整性（缺少 sha256sum 或 SHA256SUMS）" >&2
 fi
 
+mkdir -p "$(dirname "$BIN")"
 install -m 0755 "$TMP/$NAME" "$BIN.new"
 mv -f "$BIN.new" "$BIN"
 
