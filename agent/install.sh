@@ -6,9 +6,9 @@
 set -eu
 
 REPO="__REPO__"
-BIN=/usr/local/bin/cfsm-lite-agent
-ENV_DIR=/etc/cfsm-lite
-ENV_FILE=/etc/cfsm-lite/agent.env
+BIN=/opt/cfsm-lite-agent
+ENV_DIR=/opt/cfsm-lite
+ENV_FILE=/opt/cfsm-lite/agent.env
 UNIT=/etc/systemd/system/cfsm-lite-agent.service
 
 die() { echo "错误: $*" >&2; exit 1; }
