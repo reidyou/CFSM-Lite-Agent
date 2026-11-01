@@ -1,0 +1,41 @@
+name: release
+
+# 在 GitHub 网页上「发布一个 Release」（Publish release）后自动触发：
+# 编译 Linux amd64 与 arm64 两个文件，生成校验文件 SHA256SUMS，并上传到这个 Release 里。
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ github.event.release.tag_name }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+      - name: 检查与测试
+        working-directory: agent
+        run: |
+          go vet ./...
+          go test ./...
+      - name: 编译
+        working-directory: agent
+        env:
+          CGO_ENABLED: '0'
+        run: |
+          mkdir -p dist
+          for arch in amd64 arm64; do
+            GOOS=linux GOARCH=$arch go build -trimpath -ldflags "-s -w -X main.version=$TAG" -o dist/cfsm-lite-agent-linux-$arch .
+          done
+          cd dist
+          sha256sum cfsm-lite-agent-linux-amd64 cfsm-lite-agent-linux-arm64 > SHA256SUMS
+          cat SHA256SUMS
+      - name: 上传到 Release
+        run: gh release upload "$TAG" agent/dist/cfsm-lite-agent-linux-amd64 agent/dist/cfsm-lite-agent-linux-arm64 agent/dist/SHA256SUMS --clobber
