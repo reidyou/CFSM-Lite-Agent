@@ -6,7 +6,7 @@
 set -eu
 
 REPO="__REPO__"
-BIN=/opt/cfsm-lite-agent
+BIN=/opt/cfsm-lite/cfsm-lite-agent
 ENV_DIR=/opt/cfsm-lite
 ENV_FILE=/opt/cfsm-lite/agent.env
 UNIT=/etc/systemd/system/cfsm-lite-agent.service
