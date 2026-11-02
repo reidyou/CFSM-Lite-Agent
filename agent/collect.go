@@ -98,6 +98,17 @@ func reachable(network, addr string) string {
 	return "1"
 }
 
+// diskTotals 统计本机所有磁盘的总容量和已用量（MB）：只算本地块设备，网络挂载和虚拟文件系统不计入，
+// 同一块设备被挂载多次只算一次。如果一个都没识别出来（例如某些容器环境），退回到只统计根目录。
+func diskTotals() (totalMB, usedMB int64) {
+	mounts := selectDiskMounts(parseMounts(readFileString("/proc/self/mounts")))
+	totalMB, usedMB = sumDisks(mounts, statfsBytes)
+	if totalMB == 0 {
+		return sumDisks([]mountEntry{{Device: "/", Point: "/", FSType: "root"}}, statfsBytes)
+	}
+	return totalMB, usedMB
+}
+
 // collectMetrics 采集一轮指标。Ping 探测与 1 秒的 CPU、网速采样同时进行，所以一轮大约耗时 1 到 8 秒。
 func collectMetrics(ctx context.Context, cfg config, st *state) map[string]any {
 	pingCh := startPing(ctx, cfg)
@@ -111,7 +122,7 @@ func collectMetrics(ctx context.Context, cfg config, st *state) map[string]any {
 	st.advance(b.rx, b.tx, b.at, cfg.ResetDay, cfg.Interface)
 
 	mem := parseMeminfo(readFileString("/proc/meminfo"))
-	diskTotal, diskUsed := diskUsage("/")
+	diskTotal, diskUsed := diskTotals()
 	info := loadStatic()
 
 	tcp := countSockets(readFileString("/proc/net/tcp"), true) + countSockets(readFileString("/proc/net/tcp6"), true)

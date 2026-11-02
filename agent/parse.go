@@ -226,3 +226,92 @@ func cpuModel(text string) string {
 	}
 	return ""
 }
+
+// mountEntry 是 /proc/self/mounts 里的一行：设备、挂载点、文件系统类型。
+type mountEntry struct {
+	Device, Point, FSType string
+}
+
+// unescapeMount 还原 /proc/self/mounts 里的八进制转义，例如挂载点里的空格会写成 \040。
+func unescapeMount(s string) string {
+	if !strings.Contains(s, `\`) {
+		return s
+	}
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\\' && i+3 < len(s) {
+			if n, err := strconv.ParseUint(s[i+1:i+4], 8, 8); err == nil {
+				b.WriteByte(byte(n))
+				i += 3
+				continue
+			}
+		}
+		b.WriteByte(s[i])
+	}
+	return b.String()
+}
+
+func parseMounts(text string) []mountEntry {
+	var out []mountEntry
+	sc := bufio.NewScanner(strings.NewReader(text))
+	for sc.Scan() {
+		f := strings.Fields(sc.Text())
+		if len(f) < 3 {
+			continue
+		}
+		out = append(out, mountEntry{Device: unescapeMount(f[0]), Point: unescapeMount(f[1]), FSType: f[2]})
+	}
+	return out
+}
+
+// localDiskFS 是会被计入磁盘容量的「本机磁盘」文件系统类型。
+// 网络文件系统（nfs、cifs、smb3、sshfs、9p、ceph、glusterfs 等）、虚拟文件系统（proc、sysfs、tmpfs、overlay 等）
+// 和只读镜像（squashfs、iso9660）都不在其中。
+var localDiskFS = map[string]bool{
+	"ext2": true, "ext3": true, "ext4": true, "xfs": true, "btrfs": true, "f2fs": true,
+	"jfs": true, "reiserfs": true, "vfat": true, "exfat": true, "ntfs": true, "ntfs3": true, "fuseblk": true,
+}
+
+// isLocalDiskMount 判断一个挂载是否是本机的块设备磁盘：文件系统类型要在白名单里，
+// 设备必须是 /dev/ 下的真实块设备；loop（snap 等镜像）、ram、zram 和网络块设备 nbd 不算。
+func isLocalDiskMount(m mountEntry) bool {
+	if !localDiskFS[m.FSType] || !strings.HasPrefix(m.Device, "/dev/") {
+		return false
+	}
+	base := strings.TrimPrefix(m.Device, "/dev/")
+	for _, p := range []string{"loop", "ram", "zram", "nbd"} {
+		if strings.HasPrefix(base, p) {
+			return false
+		}
+	}
+	return true
+}
+
+// selectDiskMounts 挑出要统计的挂载点。同一个设备可能被挂载多次（bind 挂载、btrfs 子卷、systemd 的只读保护），
+// 只取第一次出现的，避免重复累加。
+func selectDiskMounts(entries []mountEntry) []mountEntry {
+	seen := map[string]bool{}
+	var out []mountEntry
+	for _, m := range entries {
+		if !isLocalDiskMount(m) || seen[m.Device] {
+			continue
+		}
+		seen[m.Device] = true
+		out = append(out, m)
+	}
+	return out
+}
+
+// sumDisks 把各个挂载点的容量和已用量累加，返回 MB。stat 返回字节数。
+func sumDisks(mounts []mountEntry, stat func(path string) (total, used uint64, ok bool)) (totalMB, usedMB int64) {
+	var t, u uint64
+	for _, m := range mounts {
+		tt, uu, ok := stat(m.Point)
+		if !ok {
+			continue
+		}
+		t += tt
+		u += uu
+	}
+	return int64(t >> 20), int64(u >> 20)
+}

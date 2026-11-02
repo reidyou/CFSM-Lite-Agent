@@ -327,3 +327,69 @@ func TestReporterDoesNotFollowRedirect(t *testing.T) {
 		t.Fatalf("redirect must not be followed: res=%+v err=%v hit=%v", res, err, hit)
 	}
 }
+
+const mountsSample = `/dev/vda1 / ext4 rw,relatime 0 0
+/dev/vda1 /usr ext4 ro,relatime 0 0
+/dev/vda15 /boot/efi vfat rw 0 0
+/dev/vdb1 /data xfs rw 0 0
+/dev/vdb1 /var/lib/docker/volumes xfs rw 0 0
+/dev/mapper/vg-home /home ext4 rw 0 0
+/dev/loop3 /snap/core20/1974 squashfs ro 0 0
+/dev/sdc1 /mnt/usb ntfs3 rw 0 0
+/dev/sdd1 /mnt/windows fuseblk rw 0 0
+10.0.0.2:/export/share /mnt/nfs nfs4 rw 0 0
+//nas/share /mnt/cifs cifs rw 0 0
+sshfs#user@host:/ /mnt/sshfs fuse.sshfs rw 0 0
+/dev/nbd0 /mnt/nbd ext4 rw 0 0
+tmpfs /run tmpfs rw 0 0
+overlay /var/lib/docker/overlay2/x/merged overlay rw 0 0
+proc /proc proc rw 0 0
+/dev/sde1 /mnt/with\040space ext4 rw 0 0
+`
+
+func TestUnescapeMount(t *testing.T) {
+	cases := map[string]string{
+		`/mnt/with\040space`: "/mnt/with space",
+		`/a\134b`:            `/a\b`,
+		`/plain`:             "/plain",
+		`/bad\9zzx`:          `/bad\9zzx`,
+	}
+	for in, want := range cases {
+		if got := unescapeMount(in); got != want {
+			t.Errorf("unescapeMount(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestSelectDiskMounts(t *testing.T) {
+	got := selectDiskMounts(parseMounts(mountsSample))
+	var devs []string
+	for _, m := range got {
+		devs = append(devs, m.Device)
+	}
+	want := []string{"/dev/vda1", "/dev/vda15", "/dev/vdb1", "/dev/mapper/vg-home", "/dev/sdc1", "/dev/sdd1", "/dev/sde1"}
+	if strings.Join(devs, ",") != strings.Join(want, ",") {
+		t.Fatalf("selected devices = %v, want %v", devs, want)
+	}
+	if got[0].Point != "/" || got[2].Point != "/data" || got[len(got)-1].Point != "/mnt/with space" {
+		t.Fatalf("unexpected mount points: %+v", got)
+	}
+}
+
+func TestSumDisks(t *testing.T) {
+	sizes := map[string][2]uint64{
+		"/":         {100 << 30, 40 << 30},
+		"/data":     {200 << 30, 50 << 30},
+		"/boot/efi": {512 << 20, 10 << 20},
+		"/mnt/usb":  {0, 0},
+	}
+	stat := func(path string) (uint64, uint64, bool) {
+		v, ok := sizes[path]
+		return v[0], v[1], ok
+	}
+	total, used := sumDisks(selectDiskMounts(parseMounts(mountsSample)), stat)
+	// 其余挂载点没有数据（stat 失败）会被跳过：总量 = 100GB + 200GB + 512MB
+	if total != 300*1024+512 || used != 90*1024+10 {
+		t.Fatalf("total=%d used=%d", total, used)
+	}
+}

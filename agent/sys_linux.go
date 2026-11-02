@@ -4,14 +4,17 @@ package main
 
 import "syscall"
 
-// diskUsage 返回指定路径所在文件系统的总量和已用量（MB）。
-func diskUsage(path string) (totalMB, usedMB int64) {
+// statfsBytes 返回挂载点所在文件系统的总字节数和已用字节数。
+func statfsBytes(path string) (total, used uint64, ok bool) {
 	var st syscall.Statfs_t
 	if err := syscall.Statfs(path, &st); err != nil {
-		return 0, 0
+		return 0, 0, false
 	}
 	bs := uint64(st.Bsize)
-	total := uint64(st.Blocks) * bs
-	used := (uint64(st.Blocks) - uint64(st.Bfree)) * bs
-	return int64(total / (1 << 20)), int64(used / (1 << 20))
+	blocks := uint64(st.Blocks)
+	free := uint64(st.Bfree)
+	if free > blocks {
+		free = blocks
+	}
+	return blocks * bs, (blocks - free) * bs, true
 }

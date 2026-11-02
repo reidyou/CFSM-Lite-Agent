@@ -101,7 +101,7 @@ DynamicUser=yes
 StateDirectory=cfsm-lite
 NoNewPrivileges=yes
 ProtectSystem=strict
-ProtectHome=yes
+ProtectHome=read-only
 PrivateTmp=yes
 CapabilityBoundingSet=
 
