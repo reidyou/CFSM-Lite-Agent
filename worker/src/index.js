@@ -19,6 +19,7 @@ const EXTRA_DEFAULTS = {
   tags: '', note: '', price: '', billing_cycle: 'month', auto_renewal: '0', currency: '¥',
   expire_date: '', traffic_limit: '', traffic_calc_type: 'total',
   auto_update: '0', rx_correction: null, tx_correction: null,
+  connection_mode: 'auto', wss_report_interval: '2', // auto = 有人在看时 WSS 实时上报，其余时间 HTTP POST；http = 只用 POST
 };
 const ADMIN_ONLY_FIELDS = ['note', 'auto_update', 'rx_correction', 'tx_correction'];
 const DEFAULT_SETTINGS = {
@@ -27,6 +28,7 @@ const DEFAULT_SETTINGS = {
   tg_bot_token: '', // 这里存放 Bark 地址（https://api.day.app/<设备Key>）或设备 Key
   notification_timezone: 'Asia/Shanghai',
   ping_mode: 'tcp', // 全局 Ping 探测方式：tcp / icmp（对所有节点生效）
+  ping_default: 'ct', // 默认探测目标：给 Monito 显示的那一个（ct 电信 / cu 联通 / cm 移动 / bd BGP）
   custom_ct: 'gd-ct-dualstack.ip.zstaticcdn.com',
   custom_cu: 'gd-cu-dualstack.ip.zstaticcdn.com',
   custom_cm: 'gd-cm-dualstack.ip.zstaticcdn.com',
@@ -40,7 +42,7 @@ const DEFAULT_SETTINGS = {
   traffic_notify_percents: '90,95', // 当月流量用到百分之几时提醒；留空表示不提醒
 };
 const SAVEABLE_SETTINGS = [
-  'site_title', 'tg_notify', 'tg_bot_token', 'notification_timezone', 'ping_mode',
+  'site_title', 'tg_notify', 'tg_bot_token', 'notification_timezone', 'ping_mode', 'ping_default',
   'custom_ct', 'custom_cu', 'custom_cm', 'custom_bd',
   'custom_ct_name', 'custom_cu_name', 'custom_cm_name', 'custom_bd_name',
   'expire_notify_days', 'expire_notify_hour', 'traffic_notify_percents',
@@ -158,7 +160,8 @@ const CYCLE_LABEL = {
   month: '月付', quarter: '季付', half_year: '半年付', year: '年付',
   two_years: '两年付', three_years: '三年付', four_years: '四年付', five_years: '五年付',
 };
-const CURRENCIES = ['¥', '$', '€', '£', '₽', '₣', '₹', '₫', '฿'];
+// 币种符号（页面下拉里显示为「符号 中文名」）。后 5 个是旧版本支持过的符号，只为兼容已保存的数据，页面不再提供。
+const CURRENCIES = ['$', '¥', '€', '£', '￥JPY', 'HK$', 'C$', 'S$', '₽', '₣', '₹', '₫', '฿'];
 const CALC_LABEL = { total: '上下行合计', up: '仅上行', down: '仅下行', max: '上下行取较大值' };
 
 // 解析流量上限文本：500GB、1TB、1.5T、200G、500（不写单位按 GB）。按 1024 换算成字节；空或无法识别返回 0。
@@ -254,6 +257,8 @@ function normExtra(k, raw) {
       if (v === '') return { value: '' };
       if (!/^-?\d{1,9}(\.\d{1,4})?$/.test(v)) return { error: 'invalidPrice' };
       return { value: Number(v).toFixed(2) };
+    case 'connection_mode': return v === 'auto' || v === 'http' ? { value: v } : { error: 'invalidConnectionMode' };
+    case 'wss_report_interval': return /^[1-5]$/.test(v) ? { value: v } : { error: 'invalidWssInterval' };
     case 'billing_cycle': return CYCLE_LABEL[v] ? { value: v } : { error: 'invalidBillingCycle' };
     case 'currency': return CURRENCIES.includes(v) ? { value: v } : { error: 'invalidCurrency' };
     case 'auto_renewal': case 'auto_update': return { value: v === '1' ? '1' : '0' };
@@ -302,7 +307,7 @@ export function md5hex(str) {
 // Agent 动态配置串：字段顺序固定（上游协议要求），不接受空格、换行、百分号编码，总长不超过 512 字节。
 // schema 3：基础字段；4：+connection_mode；5：+wss_report_interval；6：+ping_mode。
 // 更高版本的格式未知，返回 null（调用方回 204，让 Agent 继续用本地配置，不会出错）。
-export function buildAgentConfig(row, s, schema) {
+export function buildAgentConfig(row, s, schema, hub = false) {
   if (!(schema >= 3 && schema <= 6)) return null;
   // 节点自己的目标 > 全局设置 > 内置默认；全局留空等于使用内置默认
   const pick = (own, site, key) => (own && own.trim()) || (site && site.trim()) || DEFAULT_SETTINGS[key];
@@ -313,8 +318,11 @@ export function buildAgentConfig(row, s, schema) {
     ['custom_cm', pick(row.custom_cm, s.custom_cm, 'custom_cm')], ['custom_bd', pick(row.custom_bd, s.custom_bd, 'custom_bd')],
     ['interface', row.interface || ''],
   ];
-  if (schema >= 4) parts.push(['connection_mode', 'http']); // Lite 不提供 WebSocket，固定走 HTTP 上报
-  if (schema >= 5) parts.push(['wss_report_interval', 2]);
+  // 没有绑定实时推送中心（Durable Object）时，Agent 只能走 HTTP POST
+  const extra = safeJson(row.extra);
+  const wssSec = Math.min(5, Math.max(1, parseInt(extra.wss_report_interval, 10) || 2));
+  if (schema >= 4) parts.push(['connection_mode', hub && extra.connection_mode !== 'http' ? 'auto' : 'http']);
+  if (schema >= 5) parts.push(['wss_report_interval', wssSec]);
   if (schema >= 6) parts.push(['ping_mode', s.ping_mode === 'icmp' ? 'icmp' : 'tcp']); // 全局设置；节点表里的 ping_mode 列不再使用
   return parts.map(([k, v]) => `${k}=${v}`).join('&');
 }
@@ -364,6 +372,15 @@ function pickMetrics(b) {
 }
 
 // ---------------------------------------------------------------- 服务器行 -> API 对象
+// 对外接口（Monito 等客户端读取的）只显示一个探测目标的延迟和丢包，而我不知道客户端具体读哪个字段，
+// 所以把默认目标的数值同时写进 ct、cu、cm、bd 四组字段。管理页面用的 list 接口不经过这里，仍然是各目标的真实值。
+export function applyDefaultPing(out, slot) {
+  const sl = ['ct', 'cu', 'cm', 'bd'].includes(slot) ? slot : 'ct';
+  const pv = out['ping_' + sl];
+  const lv = out['loss_' + sl];
+  for (const k of ['ct', 'cu', 'cm', 'bd']) { out['ping_' + k] = pv; out['loss_' + k] = lv; }
+  return out;
+}
 function shape(row, ctx) {
   const extra = { ...EXTRA_DEFAULTS, ...safeJson(row.extra) };
   const m = row.metrics ? safeJson(row.metrics) : normalizeMetrics({});
@@ -374,6 +391,7 @@ function shape(row, ctx) {
     auto_renewal: extra.auto_renewal, currency: extra.currency, expire_date: extra.expire_date,
     traffic_limit: extra.traffic_limit, traffic_calc_type: extra.traffic_calc_type,
     auto_update: extra.auto_update, rx_correction: extra.rx_correction, tx_correction: extra.tx_correction,
+    connection_mode: extra.connection_mode, wss_report_interval: extra.wss_report_interval,
     interface: row.interface, reset_day: row.reset_day, collect_interval: row.collect_interval,
     report_interval: row.report_interval, ping_mode: row.ping_mode,
     custom_ct: row.custom_ct, custom_cu: row.custom_cu, custom_cm: row.custom_cm, custom_bd: row.custom_bd,
@@ -388,6 +406,7 @@ function shape(row, ctx) {
   out.lite_traffic_used_bytes = used;
   out.lite_traffic_percent = limit ? Math.round((used / limit) * 1000) / 10 : null;
   out.lite_expire_days_left = validDate(extra.expire_date) ? daysLeft(extra.expire_date, ymdInTz(ctx.now, ctx.tz)) : null;
+  if (ctx.northbound) applyDefaultPing(out, ctx.pingDefault);
   if (!ctx.admin) for (const k of ADMIN_ONLY_FIELDS) delete out[k];
   return out;
 }
@@ -397,6 +416,27 @@ async function listShaped(env, ctx, { includeHidden }) {
 }
 
 // ---------------------------------------------------------------- /update（Agent 上报）
+// 把一次上报写进 D1：状态切换与指标写入在同一个事务里，只有真正完成 OFFLINE -> ONLINE 的那一次才发恢复通知。
+// POST 上报和 WebSocket 帧（每隔约一分钟落库一次）共用这段逻辑。
+export async function persistReport(env, execCtx, row, data, { region = '', version = '', now = Date.now() } = {}) {
+  const results = await env.DB.batch([
+    env.DB.prepare("UPDATE servers SET status = 'ONLINE', status_since = ? WHERE id = ? AND status = 'OFFLINE'").bind(now, row.id),
+    env.DB.prepare(
+      "UPDATE servers SET metrics = ?, last_seen = ?, region = ?, agent_version = ?, " +
+      "status_since = CASE WHEN status = 'UNINIT' THEN ? ELSE status_since END, " +
+      "status = CASE WHEN status = 'UNINIT' THEN 'ONLINE' ELSE status END WHERE id = ?",
+    ).bind(JSON.stringify(data), now, region, version, now, row.id),
+  ]);
+  if (results[0]?.meta?.changes === 1 && row.offline_notify_disabled !== '1') {
+    execCtx.waitUntil((async () => {
+      const s = await loadSettings(env);
+      if (!notifyEnabled(s)) return;
+      await sendBark(env, s, `${row.name} 已恢复`,
+        `恢复时间：${fmtTime(now, s.notification_timezone)}\n离线时长：约 ${fmtDuration(now - row.status_since)}`);
+    })());
+  }
+}
+
 async function handleUpdate(request, env, ctx) {
   if (Number(request.headers.get('content-length') || 0) > MAX_BODY) return fail('Payload Too Large', 413);
   const text = await request.text();
@@ -411,7 +451,7 @@ async function handleUpdate(request, env, ctx) {
 
   const row = await env.DB.prepare(
     'SELECT id, name, status, status_since, offline_notify_disabled, collect_interval, report_interval, reset_day, ' +
-    'interface, ping_mode, custom_ct, custom_cu, custom_cm, custom_bd FROM servers WHERE id = ?',
+    'interface, ping_mode, custom_ct, custom_cu, custom_cm, custom_bd, extra FROM servers WHERE id = ?',
   ).bind(id).first();
   if (!row) return fail('Server not found', 404);
 
@@ -425,29 +465,13 @@ async function handleUpdate(request, env, ctx) {
   const now = Date.now();
   const region = request.cf?.country || request.headers.get('cf-ipcountry') || '';
   const version = (request.headers.get('x-agent-version') || '').slice(0, 32);
-  // batch 在 D1 里是一个事务：状态切换与指标写入不会被 Cron 插进来打断
-  const results = await env.DB.batch([
-    env.DB.prepare("UPDATE servers SET status = 'ONLINE', status_since = ? WHERE id = ? AND status = 'OFFLINE'").bind(now, id),
-    env.DB.prepare(
-      "UPDATE servers SET metrics = ?, last_seen = ?, region = ?, agent_version = ?, " +
-      "status_since = CASE WHEN status = 'UNINIT' THEN ? ELSE status_since END, " +
-      "status = CASE WHEN status = 'UNINIT' THEN 'ONLINE' ELSE status END WHERE id = ?",
-    ).bind(JSON.stringify(normalizeMetrics(m)), now, region, version, now, id),
-  ]);
-
-  // 只有真正完成 OFFLINE -> ONLINE 的那一次上报才发恢复通知
-  if (results[0]?.meta?.changes === 1 && row.offline_notify_disabled !== '1') {
-    ctx.waitUntil((async () => {
-      const s = await loadSettings(env);
-      if (!notifyEnabled(s)) return;
-      await sendBark(env, s, `${row.name} 已恢复`,
-        `恢复时间：${fmtTime(now, s.notification_timezone)}\n离线时长：约 ${fmtDuration(now - row.status_since)}`);
-    })());
-  }
+  const data = normalizeMetrics(m);
+  await persistReport(env, ctx, row, data, { region, version, now });
+  if (env.HUB) ctx.waitUntil(hubIngest(env, id, data, now)); // 让正在看的页面立刻收到这次上报
   // 动态配置协商：旧版 Agent（无 schema 头）回 OK；新版 Agent 配置没变回 204，变了回完整配置串
   const schema = parseInt(request.headers.get('x-agent-config-schema') || '', 10);
   if (!schema) return new Response('OK', { headers: { 'content-type': 'text/plain' } });
-  const body = buildAgentConfig(row, await loadSettings(env), schema);
+  const body = buildAgentConfig(row, await loadSettings(env), schema, !!env.HUB);
   if (body === null) return new Response(null, { status: 204 });
   const sum = md5hex(body);
   if ((request.headers.get('x-agent-config-md5') || '') === sum) return new Response(null, { status: 204 });
@@ -468,8 +492,8 @@ async function handlePublic(request, env, url, path) {
     return json({
       version: env.COMPAT_VERSION || COMPAT_VERSION, is_public: isPublic, authorization: admin,
       turnstile_enabled: false, turnstile_login_enabled: false, turnstile_site_key: '',
-      custom_ct_name: s.custom_ct_name, custom_cu_name: s.custom_cu_name,
-      custom_cm_name: s.custom_cm_name, custom_bd_name: s.custom_bd_name,
+      custom_ct_name: s['custom_' + (s.ping_default || 'ct') + '_name'], custom_cu_name: s['custom_' + (s.ping_default || 'ct') + '_name'],
+      custom_cm_name: s['custom_' + (s.ping_default || 'ct') + '_name'], custom_bd_name: s['custom_' + (s.ping_default || 'ct') + '_name'],
       site_title: s.site_title, display_mode: 'bar', preferred_theme: 'auto', default_language: 'auto',
       verified: false, turnstile_verified: null, theme_options: {},
       frontend_ws_timeout_minutes: 0, long_history_points: 120, latency_window: { points: 20, hours: 2 },
@@ -478,7 +502,7 @@ async function handlePublic(request, env, url, path) {
   if (!isPublic && !admin) return fail('Unauthorized', 401);
 
   const s = await loadSettings(env);
-  const ctx = { now: Date.now(), thresholdMs: thresholdSec(s) * 1000, admin, tz: s.notification_timezone };
+  const ctx = { now: Date.now(), thresholdMs: thresholdSec(s) * 1000, admin, tz: s.notification_timezone, northbound: true, pingDefault: s.ping_default };
 
   if (path === '/api/servers') {
     const servers = (await listShaped(env, ctx, { includeHidden: admin })).map((x) => ({ ...x, ping: [], loss: [] }));
@@ -553,8 +577,16 @@ async function handleAdmin(request, env) {
           username: env.ADMIN_USERNAME || 'admin',
         },
         agent_install_ready: REPO_RE.test(String(env.AGENT_REPO || '').trim()),
+        realtime_available: !!env.HUB,
         api_secret: env.API_SECRET, // 与上游一致：登录后可见，Monito 生成 Agent 安装命令时需要
       });
+    }
+    case 'realtime_status': {
+      if (!env.HUB) return json({ success: true, available: false, viewers: 0, agents: [] });
+      try {
+        const j = await (await hubStub(env).fetch('https://hub/internal/status')).json();
+        return json({ success: true, available: true, viewers: j.viewers, agents: j.agents });
+      } catch { return json({ success: true, available: true, viewers: 0, agents: [], error: true }); }
     }
     case 'save_settings': return saveSettings(env, b.settings);
     case 'send_test_notification': {
@@ -622,6 +654,7 @@ async function saveSettings(env, input) {
     if (k === 'tg_bot_token' && !v) continue; // 空值不覆盖：Bark 地址不会被设置页回传的空字符串清掉
     if (k === 'tg_notify' && !(v === '0' || (/^\d+$/.test(v) && +v >= 2 && +v <= 30))) return fail('invalidNotifyValue', 400);
     if (k === 'ping_mode' && !['tcp', 'icmp'].includes(v)) return fail('invalidPingMode', 400);
+    if (k === 'ping_default' && !['ct', 'cu', 'cm', 'bd'].includes(v)) return fail('invalidPingDefault', 400);
     if (k === 'notification_timezone') {
       try { new Intl.DateTimeFormat('zh-CN', { timeZone: v }); } catch { return fail('invalidTimezone', 400); }
     }
@@ -865,6 +898,7 @@ function wsToken(request, url) {
 export function createWsSession(sock, env, scope0, opts = {}) {
   const now = opts.now || Date.now;
   const timers = opts.timers || { setInterval, clearInterval };
+  const pingDefault = opts.pingDefault || 'ct'; // 连接建立时读取；在管理页修改后，客户端重连才生效
   let scope = scope0;
   let ids = scope === 'all' ? null : new Set([scope]); // null 表示全部节点
   let wmark = now() - 20000; // 连接时补发最近 20 秒内的上报，避免和首次拉取列表之间漏数据
@@ -890,7 +924,7 @@ export function createWsSession(sock, env, scope0, opts = {}) {
         if (ids && !ids.has(r.id)) continue;
         if ((sent.get(r.id) || 0) >= r.last_seen) continue;
         sent.set(r.id, r.last_seen);
-        updates.push({ serverId: r.id, samples: [{ ts: r.last_seen, data: { ...safeJson(r.metrics), last_updated: r.last_seen } }] });
+        updates.push({ serverId: r.id, samples: [{ ts: r.last_seen, data: applyDefaultPing({ ...safeJson(r.metrics), last_updated: r.last_seen }, pingDefault) }] });
       }
       wmark = Math.max(wmark, maxSeen - 1000); // 留 1 秒余量，覆盖同一毫秒内的并发写入
       if (updates.length) send({ type: 'batchUpdate', ts: now(), updates });
@@ -940,10 +974,18 @@ async function handleWs(request, env, url) {
   }
   const scope = url.searchParams.get('subscribe') || 'all';
   if (scope !== 'all' && !ID_RE.test(scope)) return new Response('Invalid subscription scope', { status: 400, headers: { 'content-type': 'text/plain' } });
+  if (env.HUB) {
+    const req = new Request(request);
+    req.headers.set('x-hub-role', 'viewer');
+    req.headers.set('x-hub-scope', scope);
+    return hubStub(env).fetch(req);
+  }
   if (typeof WebSocketPair === 'undefined') return fail('WebSocket not enabled', 503);
+  let pingDefault = 'ct';
+  try { pingDefault = (await loadSettings(env)).ping_default || 'ct'; } catch { /* 读取失败就用默认值 */ }
   const [client, server] = Object.values(new WebSocketPair());
   server.accept();
-  createWsSession(server, env, scope);
+  createWsSession(server, env, scope, { pingDefault }); // accept 之后要立刻挂上监听，中间不能有 await
   return new Response(null, { status: 101, webSocket: client });
 }
 
@@ -1096,7 +1138,7 @@ const ADMIN_HTML = String.raw`<!doctype html>
 @media (prefers-color-scheme:dark){:root{--bg:#0f1318;--card:#181e26;--fg:#e6e9ef;--mut:#8b95a5;--line:#2a323d;--pri:#5b8def;--ok:#34d399;--bad:#f87171;--off:#667085}}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;padding:env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left)}
-#app{max-width:760px;margin:0 auto;padding:12px}
+#app{max-width:1100px;margin:0 auto;padding:12px}
 h1{font-size:22px;margin:0 0 4px}
 .top{display:flex;justify-content:space-between;align-items:center;padding:6px 2px 10px}
 .tabs{display:flex;gap:6px;margin-bottom:12px}
@@ -1136,20 +1178,45 @@ summary{cursor:pointer;color:var(--mut)}
 .login{max-width:360px;margin:12vh auto 0}
 .toast{position:fixed;left:50%;bottom:calc(20px + env(safe-area-inset-bottom));transform:translateX(-50%);background:#222;color:#fff;padding:9px 16px;border-radius:10px;max-width:90vw;z-index:9;font-size:14px}
 .toast.bad{background:#b91c1c}
-.grid{display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin:8px 0}
-@media (min-width:560px){.grid{grid-template-columns:repeat(3,1fr)}}
-.stat{background:var(--bg);border-radius:9px;padding:7px 9px;min-width:0}
-.stat .k{font-size:12px;color:var(--mut)}
-.stat .v{font-size:13px;word-break:break-word}
-.stat .s{font-size:12px;color:var(--mut);word-break:break-word}
-.bar{height:5px;border-radius:3px;background:var(--line);margin-top:5px;overflow:hidden}
+.bar{height:4px;border-radius:2px;background:var(--line);margin-top:3px;overflow:hidden}
 .bar i{display:block;height:100%;background:var(--ok)}
 .bar i.warn{background:#d97706}
 .bar i.bad{background:var(--bad)}
 .chip{display:inline-block;font-size:12px;border:1px solid var(--line);border-radius:999px;padding:1px 8px;margin:2px 4px 2px 0}
-.exp{font-size:13px;margin-top:4px}
-.exp.warn{color:var(--bad)}
 .off{opacity:.65}
+.nodes{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,390px),1fr));gap:10px;align-items:start}
+.nodes .card{margin:0}
+.nodes .card.wide{grid-column:1/-1}
+.ncard{padding:10px 12px}
+.ttl{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.ttl .dot{margin-right:2px}
+.nm{font-size:16px}
+.tag{display:inline-block;font-size:11px;line-height:1.5;color:var(--mut);background:var(--bg);border-radius:999px;padding:0 8px}
+.sub{font-size:12px;color:var(--mut);margin:2px 0 0}
+.st{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));margin-top:8px}
+.st2{border-top:1px solid var(--line);padding-top:8px}
+.st .c{padding:0 7px;border-left:1px solid var(--line);min-width:0}
+.st .c:first-child{padding-left:0;border-left:0}
+.st .k{font-size:11px;color:var(--mut)}
+.st .v{font-size:15px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.st .s{font-size:11px;color:var(--mut);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.st .ln{font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;line-height:1.55}
+.up{color:var(--ok)}
+.dn{color:var(--pri)}
+.ok{color:var(--ok)}
+.warnc{color:#d97706}
+.badc{color:var(--bad)}
+.tap{cursor:pointer}
+.pdetail{margin-top:6px}
+.foot{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-top:8px;flex-wrap:wrap}
+.foot .info{display:flex;align-items:center;gap:4px;flex-wrap:wrap;min-width:0;font-size:12px}
+.exp{font-size:12px}
+.exp.warn{color:var(--bad)}
+.srow{display:flex;align-items:center;gap:8px;padding:7px 0;border-top:1px solid var(--line)}
+.srow:first-of-type{border-top:0}
+.srow .nm{flex:1;min-width:0;font-size:15px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.srow .idx{width:22px;text-align:right;font-size:12px}
+.narrow,.top,.tabs{max-width:760px;margin-left:auto;margin-right:auto}
 .sec{font-size:13px;font-weight:600;margin:16px 0 2px;padding-top:8px;border-top:1px dashed var(--line)}
 [hidden]{display:none!important}
 </style>
@@ -1164,12 +1231,13 @@ summary{cursor:pointer;color:var(--mut)}
   var app = document.getElementById('app');
   var toastEl = document.getElementById('toast');
   var token = sessionStorage.getItem('cfsm_t') || '';
-  var S = { tab: 'nodes', servers: [], settings: {}, secret: '', ready: false, open: {} };
+  var S = { tab: 'nodes', servers: [], settings: {}, secret: '', ready: false, open: {}, sorting: false, rt: { available: false, viewers: 0, agents: [] } };
   var SLOTS = [['ct', '电信'], ['cu', '联通'], ['cm', '移动'], ['bd', 'BGP']];
   var ERR = {
     invalidCredentials: '用户名或密码错误', missingCredentials: '请输入用户名和密码',
     Unauthorized: '登录已过期，请重新登录', invalidServerId: '节点 ID 无效',
     '服务器名称无效': '名称需要 1 到 100 个字符',
+    invalidConnectionMode: '连接模式只能是「自动」或「仅 HTTP POST」', invalidWssInterval: '看盘上报间隔只能是 1 到 5 秒',
     invalidReportInterval: '上报间隔只能是 30、60、120、180 秒',
     invalidCollectInterval: '采集间隔只能是 0、1、2、5、10 秒',
     invalidResetDay: '流量重置日需要是 0 到 31 的整数',
@@ -1180,7 +1248,7 @@ summary{cursor:pointer;color:var(--mut)}
     tgBotTokenRequired: '请先填写 Bark 地址或设备 Key',
     testNotificationFailed: '测试通知发送失败，请检查 Bark 地址或设备 Key',
     invalidPrice: '续费金额格式不对，例如 30 或 29.99',
-    invalidBillingCycle: '付费周期无效', invalidCurrency: '币种无效',
+    invalidBillingCycle: '付费周期无效', invalidCurrency: '币种无效', invalidPingDefault: '默认探测目标无效',
     invalidExpireDate: '到期日格式不对，应为 年-月-日',
     invalidTrafficLimit: '流量上限格式不对，例如 500GB、1TB（不写单位按 GB）',
     invalidExpireDays: '到期提醒天数格式不对，例如 7,3,1,0（0 到 365，最多 6 个）',
@@ -1257,10 +1325,23 @@ summary{cursor:pointer;color:var(--mut)}
     return d > 0 ? d + ' 天 ' + hh + ' 小时' : hh > 0 ? hh + ' 小时 ' + m + ' 分' : m + ' 分';
   }
   function pct(a, b) { return b > 0 ? Math.min(100, Math.round(a * 100 / b)) : 0; }
-  function bar(p) { return h('div', { class: 'bar' }, h('i', { class: p >= 90 ? 'bad' : p >= 75 ? 'warn' : '', style: 'width:' + p + '%' })); }
-  function stat(label, value, p, sub) {
-    return h('div', { class: 'stat' }, h('div', { class: 'k' }, label), h('div', { class: 'v' }, value),
-      p === undefined || p === null ? null : bar(p), sub ? h('div', { class: 's' }, sub) : null);
+  var CURRENCY_LIST = [['$', '$ 美元'], ['¥', '¥ 人民币'], ['€', '€ 欧元'], ['£', '£ 英镑'], ['￥JPY', '￥JPY 日元'], ['HK$', 'HK$ 港币'], ['C$', 'C$ 加拿大元'], ['S$', 'S$ 新加坡元']];
+  function fmt1(n) { return (Math.round((Number(n) || 0) * 10) / 10).toFixed(1); }
+  function pct1(a, b) { return b > 0 ? fmt1(Math.min(100, a * 100 / b)) + '%' : '0.0%'; }
+  function fmtSpeed(n) { return fmtBytes(n) + '/s'; }
+  function lvl(p) { return p >= 90 ? 'bad' : p >= 75 ? 'warn' : ''; }
+  function flag(cc) {
+    cc = String(cc || '').toUpperCase();
+    if (!/^[A-Z]{2}$/.test(cc)) return cc;
+    return String.fromCodePoint(0x1F1E6 + cc.charCodeAt(0) - 65, 0x1F1E6 + cc.charCodeAt(1) - 65) + ' ' + cc;
+  }
+  // 一个统计小块：标签、数值、可选的进度条、可选的小字
+  function blk(label, value, p, sub, cls, onclick) {
+    return h('div', { class: 'c' + (onclick ? ' tap' : ''), onclick: onclick },
+      h('div', { class: 'k' }, label),
+      h('div', { class: 'v' + (cls ? ' ' + cls : '') }, value),
+      p === null || p === undefined ? null : h('div', { class: 'bar' }, h('i', { class: lvl(p), style: 'width:' + p + '%' })),
+      sub ? h('div', { class: 's' }, sub) : null);
   }
   function pad2(n) { return String(n).padStart(2, '0'); }
   function todayStr() { var d = new Date(); return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate()); }
@@ -1288,7 +1369,8 @@ summary{cursor:pointer;color:var(--mut)}
     return j;
   }
   async function load() {
-    var r = await Promise.all([api({ action: 'list' }), api({ action: 'get_settings' })]);
+    var r = await Promise.all([api({ action: 'list' }), api({ action: 'get_settings' }), api({ action: 'realtime_status' }).catch(function () { return null; })]);
+    S.rt = r[2] && r[2].success ? { available: !!r[2].available, viewers: r[2].viewers || 0, agents: r[2].agents || [] } : { available: false, viewers: 0, agents: [] };
     S.servers = r[0].servers;
     S.settings = r[1].settings;
     S.secret = r[1].api_secret;
@@ -1347,7 +1429,9 @@ summary{cursor:pointer;color:var(--mut)}
     f.group = h('input', { type: 'text', value: s.server_group, maxlength: '64' });
     // 续费与到期
     f.price = h('input', { type: 'text', value: s.price, placeholder: '例如 30，免费填 0' });
-    f.currency = sel(['¥', '$', '€', '£', '₽', '₣', '₹', '₫', '฿'], s.currency, function (v) { return v; });
+    var curVals = CURRENCY_LIST.map(function (c) { return c[0]; });
+    if (curVals.indexOf(s.currency) < 0) curVals.push(s.currency); // 兼容以前保存过的其他符号
+    f.currency = sel(curVals, s.currency, function (v) { return labelOf(CURRENCY_LIST, v); });
     f.cycle = sel(CYCLES.map(function (c) { return c[0]; }), s.billing_cycle, function (v) { return labelOf(CYCLES, v); });
     f.expire = h('input', { type: 'date', value: s.expire_date });
     f.auto = h('input', { type: 'checkbox', checked: s.auto_renewal === '1' });
@@ -1363,7 +1447,9 @@ summary{cursor:pointer;color:var(--mut)}
     f.iface = h('input', { type: 'text', value: s.interface, placeholder: '留空自动汇总，多个网卡用英文逗号分隔' });
     // 采集与通知
     f.report = sel([30, 60, 120, 180], s.report_interval, function (v) { return v + ' 秒'; });
-    f.collect = sel([0, 1, 2, 5, 10], s.collect_interval, function (v) { return v === 0 ? '不额外采样' : v + ' 秒'; });
+    f.collect = sel([0, 1, 2, 5, 10], s.collect_interval, function (v) { return v === 0 ? '0 秒（按上报间隔采样）' : v + ' 秒'; });
+    f.mode = sel(['auto', 'http'], s.connection_mode || 'auto', function (v) { return v === 'auto' ? '自动（有人在看时实时推送，其余时间 HTTP POST）' : '仅 HTTP POST（不实时）'; });
+    f.wss = sel([1, 2, 3, 4, 5], s.wss_report_interval || '2', function (v) { return v + ' 秒'; });
     f.hidden = h('input', { type: 'checkbox', checked: s.is_hidden === '1' });
     f.mute = h('input', { type: 'checkbox', checked: s.offline_notify_disabled === '1' });
     SLOTS.forEach(function (p) {
@@ -1378,6 +1464,7 @@ summary{cursor:pointer;color:var(--mut)}
         auto_renewal: f.auto.checked ? '1' : '0',
         traffic_limit: f.limit.value.trim(), traffic_calc_type: f.calc.value, reset_day: Number(f.reset.value || 0), interface: f.iface.value.trim(),
         report_interval: Number(f.report.value), collect_interval: Number(f.collect.value),
+        connection_mode: f.mode.value, wss_report_interval: f.wss.value,
         is_hidden: f.hidden.checked ? '1' : '0', offline_notify_disabled: f.mute.checked ? '1' : '0',
         tags: f.tags.value.trim(), note: f.note.value.trim()
       };
@@ -1397,8 +1484,11 @@ summary{cursor:pointer;color:var(--mut)}
       field('流量计算方式', f.calc, '按厂商的计费方式选择'),
       field('每月流量重置日', f.reset, '1 到 31；0 表示不重置；大于当月天数时取当月最后一天'),
       field('统计网卡', f.iface),
-      h('div', { class: 'sec' }, '采集与通知'),
-      field('上报间隔', f.report, '越短越实时，请求量也越大'), field('本机采集间隔', f.collect),
+      h('div', { class: 'sec' }, '采集、上报与通知'),
+      field('上报间隔', f.report, '没人看的时候，Agent 每隔这么久用 HTTP POST 上报一次并写入数据库；越短越实时，请求量和数据库写入也越多'),
+      field('采集间隔', f.collect, 'Lite 不保存历史曲线，这一项目前不起作用，保留只是和原版的设置项一致'),
+      field('连接模式', f.mode, S.rt.available ? '「自动」：Agent 保持一条空闲的 WebSocket，有人打开 Monito 或网页时自动切到实时推送' : '当前没有启用实时推送（需要按 README 用 GitHub 连接部署），这一项暂时不生效'),
+      field('看盘上报间隔', f.wss, '有人在看（Monito 或网页打开）时，Agent 每隔几秒推送一次实时数据，只对「自动」模式有效；这些实时数据不写数据库'),
       check(f.hidden, '在 Monito 等客户端中隐藏此节点'),
       check(f.mute, '此节点离线或恢复时不发送通知'),
       h('details', null, h('summary', null, '此节点专用的 Ping 目标（可选）'),
@@ -1414,43 +1504,83 @@ summary{cursor:pointer;color:var(--mut)}
   }
   function nodeCard(s) {
     var online = s.is_online;
-    var meta = [s.server_group];
-    if (s.region) meta.push(s.region);
-    if (s.os) meta.push(s.os + (s.arch ? ' ' + s.arch : ''));
-    meta.push(online ? '已在线 ' + fmtUptime(s.boot_time) : '离线 · ' + ago(s.last_updated));
-    if (s.agent_version) meta.push(s.agent_version);
-    if (s.is_hidden === '1') meta.push('已隐藏');
-    var ramP = pct(s.ram_used, s.ram_total), diskP = pct(s.disk_used, s.disk_total);
+    var dflt = gv('ping_default') || 'ct';
+    var sub = [];
+    if (s.os) sub.push(s.os + (s.arch ? ' ' + s.arch : ''));
+    sub.push(online ? '已在线 ' + fmtUptime(s.boot_time) : '离线 · ' + ago(s.last_updated));
+    if (s.agent_version) sub.push(s.agent_version);
+    if (s.is_hidden === '1') sub.push('已隐藏');
+
     var limited = s.lite_traffic_limit_bytes > 0;
     var tp = limited ? Math.min(100, Math.round(s.lite_traffic_percent)) : null;
-    var trafSub = limited ? '已用 ' + fmtBytes(s.lite_traffic_used_bytes) + ' / ' + fmtBytes(s.lite_traffic_limit_bytes) + '（' + s.lite_traffic_percent + '%，' + labelOf(CALCS, s.traffic_calc_type) + '）' : '未设置流量上限';
-    var grid = h('div', { class: 'grid' },
-      stat('CPU', (Math.round(s.cpu * 10) / 10) + '%', Math.min(100, Math.round(s.cpu)), '负载 ' + s.load_avg),
-      stat('内存', fmtMB(s.ram_used) + ' / ' + fmtMB(s.ram_total), ramP, ramP + '%'),
-      stat('磁盘', fmtMB(s.disk_used) + ' / ' + fmtMB(s.disk_total), diskP, diskP + '%'),
-      stat('网速', '↓ ' + fmtBytes(s.net_in_speed) + '/s', null, '↑ ' + fmtBytes(s.net_out_speed) + '/s'),
-      stat('当月流量', '↓ ' + fmtBytes(s.net_rx_monthly) + '  ↑ ' + fmtBytes(s.net_tx_monthly), tp, trafSub),
-      stat('累计流量', '↓ ' + fmtBytes(s.net_rx), null, '↑ ' + fmtBytes(s.net_tx)));
-    var chips = h('div', null, SLOTS.map(function (p) {
-      return h('span', { class: 'chip' }, (gv('custom_' + p[0] + '_name') || p[1]) + ' ' + fmtPing(s['ping_' + p[0]]) + ' / ' + fmtLoss(s['loss_' + p[0]]));
-    }));
+    var dp = s['ping_' + dflt], dl = s['loss_' + dflt];
+    var pingTxt = dp === false || dp === undefined ? '—' : dp === null ? '超时' : fmt1(dp) + ' ms';
+    var lossTxt = dl === false || dl === undefined || dl === null ? '—' : dl + '%';
+    var pingCls = typeof dp !== 'number' ? 'mut' : dp < 100 ? 'ok' : dp < 300 ? 'warnc' : 'badc';
+    var lossCls = typeof dl !== 'number' ? 'mut' : dl === 0 ? 'ok' : dl < 20 ? 'warnc' : 'badc';
+    var togglePing = function () { S.open[s.id + '#ping'] = !S.open[s.id + '#ping']; render(); };
+
+    var row1 = h('div', { class: 'st' },
+      blk('CPU', fmt1(s.cpu) + '%', Math.min(100, Math.round(s.cpu)), String(s.load_avg || '').split(' ').join(', ')),
+      blk('内存', pct1(s.ram_used, s.ram_total), pct(s.ram_used, s.ram_total), fmtMB(s.ram_used) + ' / ' + fmtMB(s.ram_total)),
+      blk('磁盘', pct1(s.disk_used, s.disk_total), pct(s.disk_used, s.disk_total), fmtMB(s.disk_used) + ' / ' + fmtMB(s.disk_total)),
+      blk('流量', fmtBytes(s.lite_traffic_used_bytes), tp, limited ? fmtBytes(s.lite_traffic_used_bytes) + ' / ' + fmtBytes(s.lite_traffic_limit_bytes) : '本月累计'));
+    var row2 = h('div', { class: 'st st2' },
+      h('div', { class: 'c' }, h('div', { class: 'ln up' }, '↑ ' + fmtSpeed(s.net_out_speed)), h('div', { class: 'ln dn' }, '↓ ' + fmtSpeed(s.net_in_speed))),
+      h('div', { class: 'c' }, h('div', { class: 'ln mut' }, '↑ ' + fmtBytes(s.net_tx)), h('div', { class: 'ln mut' }, '↓ ' + fmtBytes(s.net_rx))),
+      blk('延迟', pingTxt, typeof dp === 'number' ? Math.min(100, Math.round(dp / 3)) : null, null, pingCls, togglePing),
+      blk('丢包', lossTxt, typeof dl === 'number' ? Math.min(100, dl * 5) : null, null, lossCls, togglePing));
+    var detail = S.open[s.id + '#ping'] ? h('div', { class: 'pdetail' }, SLOTS.map(function (p) {
+      return h('span', { class: 'chip' }, (p[0] === dflt ? '★ ' : '') + (gv('custom_' + p[0] + '_name') || p[1]) + ' ' + fmtPing(s['ping_' + p[0]]) + ' / ' + fmtLoss(s['loss_' + p[0]]));
+    })) : null;
+
+    var tags = String(s.tags || '').split(',').map(function (t) { return t.trim(); }).filter(Boolean);
+    var dl2 = s.lite_expire_days_left;
     var exp = [];
-    var dl = s.lite_expire_days_left;
-    if (s.expire_date) exp.push('到期 ' + s.expire_date + (dl === null ? '' : dl >= 0 ? '（剩 ' + dl + ' 天）' : '（已过期 ' + (-dl) + ' 天）'));
+    if (s.expire_date) exp.push('到期 ' + s.expire_date + (dl2 === null ? '' : dl2 >= 0 ? '（剩 ' + dl2 + ' 天）' : '（已过期 ' + (-dl2) + ' 天）'));
     if (priceLine(s)) exp.push('续费 ' + priceLine(s));
-    var card = h('div', { class: 'card' + (online ? '' : ' off') },
-      h('div', { class: 'row between' },
-        h('div', null, h('span', { class: 'dot' + (online ? ' ok' : '') }), h('b', null, s.name)),
-        h('div', { class: 'row gap' },
-          h('button', { class: 'btn sm', type: 'button', onclick: function () { toggle(s.id, 'install'); } }, '安装命令'),
-          h('button', { class: 'btn sm', type: 'button', onclick: function () { toggle(s.id, 'edit'); } }, '编辑'),
-          h('button', { class: 'btn sm bad', type: 'button', onclick: function () { del(s); } }, '删除'))),
-      h('p', { class: 'mut sm' }, meta.join(' · ')),
-      grid, chips,
-      exp.length ? h('div', { class: 'exp' + (dl !== null && dl <= 7 ? ' warn' : '') }, exp.join(' · ')) : null);
+    var foot = h('div', { class: 'foot' },
+      h('div', { class: 'info' }, tags.map(function (t) { return h('span', { class: 'tag' }, t); }),
+        exp.length ? h('span', { class: 'exp' + (dl2 !== null && dl2 <= 7 ? ' warn' : ' mut') }, exp.join(' · ')) : null),
+      h('div', { class: 'row gap' },
+        h('button', { class: 'btn sm', type: 'button', onclick: function () { toggle(s.id, 'install'); } }, '安装命令'),
+        h('button', { class: 'btn sm', type: 'button', onclick: function () { toggle(s.id, 'edit'); } }, '编辑'),
+        h('button', { class: 'btn sm bad', type: 'button', onclick: function () { del(s); } }, '删除')));
+
+    var opened = S.open[s.id] === 'install' || S.open[s.id] === 'edit';
+    var card = h('div', { class: 'card ncard' + (online ? '' : ' off') + (opened ? ' wide' : '') },
+      h('div', { class: 'ttl' }, h('span', { class: 'dot' + (online ? ' ok' : '') }), h('b', { class: 'nm' }, s.name),
+        s.server_group && s.server_group !== 'Default' ? h('span', { class: 'tag' }, s.server_group) : null,
+        s.region ? h('span', { class: 'tag' }, flag(s.region)) : null,
+        S.rt.agents.indexOf(s.id) >= 0 ? h('span', { class: 'tag' }, '实时通道') : null),
+      h('p', { class: 'sub' }, sub.join(' · ')), row1, row2, detail, foot);
     if (S.open[s.id] === 'install') card.append(installPanel(s));
     if (S.open[s.id] === 'edit') card.append(editPanel(s));
     return card;
+  }
+  // 手动排序：先在本地调整并立刻重绘，再把完整顺序保存到 Worker（Monito 里的顺序也随之变化）
+  async function move(id, how) {
+    var ids = S.servers.map(function (x) { return x.id; });
+    var i = ids.indexOf(id);
+    var j = how === 'top' ? 0 : i + how;
+    if (i < 0 || j < 0 || j >= ids.length || j === i) return;
+    var cur = S.servers.splice(i, 1)[0];
+    S.servers.splice(j, 0, cur);
+    render();
+    try { await api({ action: 'save_order', orders: S.servers.map(function (x) { return x.id; }) }); }
+    catch (e) { toast(e.message, true); await load(); }
+  }
+  function sortList() {
+    return h('div', { class: 'card narrow' },
+      h('p', { class: 'mut sm' }, '用按钮调整顺序，每次点击都会立刻保存；Monito 里的节点顺序也会同步。调整完点上方的「完成排序」。'),
+      S.servers.map(function (s, i) {
+        return h('div', { class: 'srow' },
+          h('span', { class: 'idx mut' }, String(i + 1)), h('span', { class: 'dot' + (s.is_online ? ' ok' : '') }), h('b', { class: 'nm' }, s.name),
+          h('div', { class: 'row gap' },
+            h('button', { class: 'btn sm', type: 'button', disabled: i === 0, onclick: function () { move(s.id, 'top'); } }, '置顶'),
+            h('button', { class: 'btn sm', type: 'button', disabled: i === 0, onclick: function () { move(s.id, -1); } }, '▲'),
+            h('button', { class: 'btn sm', type: 'button', disabled: i === S.servers.length - 1, onclick: function () { move(s.id, 1); } }, '▼')));
+      }));
   }
   function viewNodes() {
     var name = h('input', { type: 'text', placeholder: '新节点名称', maxlength: '100' });
@@ -1460,24 +1590,30 @@ summary{cursor:pointer;color:var(--mut)}
       try { var j = await api({ action: 'add', name: n }); S.open[j.id] = 'install'; await load(); toast('已添加，请复制下方的安装命令'); }
       catch (e) { toast(e.message, true); }
     } }, '添加节点');
+    var sortBtn = h('button', { class: 'btn' + (S.sorting ? ' pri' : ''), type: 'button', onclick: function () { S.sorting = !S.sorting; render(); } }, S.sorting ? '完成排序' : '调整顺序');
     var online = S.servers.filter(function (x) { return x.is_online; }).length;
     return h('div', null,
-      h('div', { class: 'card' }, h('div', { class: 'row' }, name, addBtn),
-        h('p', { class: 'mut sm' }, '共 ' + S.servers.length + ' 台，在线 ' + online + ' 台')),
-      S.servers.length ? S.servers.map(nodeCard) : h('p', { class: 'mut' }, '还没有节点：先添加一个，再把安装命令粘贴到服务器上执行。'));
+      h('div', { class: 'card narrow' }, h('div', { class: 'row' }, name, addBtn),
+        h('div', { class: 'row between' }, h('p', { class: 'mut sm' }, '共 ' + S.servers.length + ' 台，在线 ' + online + ' 台'), S.servers.length > 1 ? sortBtn : null),
+        h('p', { class: 'mut sm' }, S.rt.available
+          ? '实时推送：已启用 · 现在有 ' + S.rt.viewers + ' 个页面或 App 在看 · ' + S.rt.agents.length + ' 台 Agent 已连接'
+          : '实时推送：未启用（按 README 用 GitHub 连接部署后才有，目前 Monito 约每分钟刷新一次）')),
+      !S.servers.length ? h('p', { class: 'mut narrow' }, '还没有节点：先添加一个，再把安装命令粘贴到服务器上执行。')
+        : S.sorting ? sortList() : h('div', { class: 'nodes' }, S.servers.map(nodeCard)));
   }
 
   /* ---------- Ping 与丢包 ---------- */
   function viewPing() {
     var f = {};
     f.mode = sel(['tcp', 'icmp'], gv('ping_mode') || 'tcp', function (v) { return v === 'tcp' ? 'TCP（推荐，无需特殊权限）' : 'ICMP（仅原版 Agent 支持，Lite Agent 会自动改用 TCP）'; });
+    f.dflt = sel(['ct', 'cu', 'cm', 'bd'], gv('ping_default') || 'ct', function (v) { return gv('custom_' + v + '_name') || labelOf(SLOTS, v); });
     var rows = SLOTS.map(function (p) {
       f['n_' + p[0]] = h('input', { type: 'text', value: gv('custom_' + p[0] + '_name') || p[1], maxlength: '16' });
       f['t_' + p[0]] = h('input', { type: 'text', value: gv('custom_' + p[0]), placeholder: 'host 或 host:port，留空使用内置默认' });
       return h('div', { class: 'slot' }, h('div', { class: 'lbl' }, '名称与探测目标'), h('div', { class: 'row' }, f['n_' + p[0]], f['t_' + p[0]]));
     });
     var save = h('button', { class: 'btn pri', type: 'button', onclick: function () {
-      var o = { ping_mode: f.mode.value };
+      var o = { ping_mode: f.mode.value, ping_default: f.dflt.value };
       SLOTS.forEach(function (p) {
         o['custom_' + p[0] + '_name'] = f['n_' + p[0]].value.trim() || p[1];
         o['custom_' + p[0]] = f['t_' + p[0]].value.trim();
@@ -1494,7 +1630,9 @@ summary{cursor:pointer;color:var(--mut)}
     return h('div', null,
       h('div', { class: 'card' },
         h('p', { class: 'mut sm' }, '延迟和丢包都由每台服务器上的 Agent 对下面 4 个目标发探测得出，丢包率与延迟来自同一轮探测，没有单独的丢包开关。这里的设置对所有节点生效，个别节点要用不同目标，可在「节点 → 编辑」里单独设置。'),
-        field('探测方式', f.mode), rows, h('div', { class: 'row' }, save)),
+        field('探测方式', f.mode),
+        field('默认探测目标', f.dflt, 'Monito 一次只能显示一个目标的延迟和丢包，管理页面的节点卡片也用它；点击卡片上的「延迟」或「丢包」可以展开看全部目标。已打开的 Monito 需要重新打开才会切换。'),
+        rows, h('div', { class: 'row' }, save)),
       h('div', { class: 'card' }, h('b', null, '最新读数（延迟 / 丢包）'),
         h('p', { class: 'mut sm' }, '「—」表示未配置或未取样，「超时」表示这一轮全部探测失败。'),
         h('div', { class: 'scroll' }, tbl)));
@@ -1578,6 +1716,7 @@ summary{cursor:pointer;color:var(--mut)}
       return h('button', { class: 'tab' + (S.tab === t[0] ? ' on' : ''), type: 'button', onclick: function () { S.tab = t[0]; render(); } }, t[1]);
     }));
     var body = { nodes: viewNodes, ping: viewPing, notify: viewNotify, system: viewSystem }[S.tab]();
+    if (S.tab !== 'nodes') body = h('div', { class: 'narrow' }, body);
     app.replaceChildren(
       h('header', { class: 'top' }, h('b', null, (S.settings.site_title || 'CFSM Lite') + ' 管理'),
         h('button', { class: 'btn sm', type: 'button', onclick: logout }, '退出')),
@@ -1603,6 +1742,190 @@ function adminPage() {
   });
 }
 
+// ---------------------------------------------------------------- 实时推送中心（Durable Object）
+// 与原版 CF-Server-Monitor 相同的思路：Agent 和前端（Monito、网页）都连到同一个 Durable Object，由它在内存里转发。
+// - 没人在看：Agent 保持一条空闲的 WebSocket，仍按「上报间隔」用 HTTP POST 上报；DO 处于休眠，几乎不计费。
+// - 有人在看：DO 通知 Agent 切到实时模式，Agent 每「看盘上报间隔」秒推一帧，DO 直接广播给所有前端（不写数据库）；
+//   Agent 仍按「上报间隔」用 HTTP POST 上报并写入 D1，所以数据库写入量和以前一样。
+const HUB_PERSIST_MS = 100000; // 实时帧的保底入库间隔：必须小于离线阈值（默认 180 秒）
+const WS_OPEN = 1;
+
+function hubStub(env) { return env.HUB.get(env.HUB.idFromName('hub')); }
+async function hubIngest(env, id, data, ts) {
+  try {
+    await hubStub(env).fetch('https://hub/internal/ingest', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id, data, ts }),
+    });
+  } catch (e) { console.error('hub ingest failed:', e?.message || e); }
+}
+
+export class Hub {
+  constructor(ctx, env) {
+    this.ctx = ctx;
+    this.env = env;
+    this.lastPersist = new Map(); // 节点 ID -> 上次写 D1 的时间（DO 被回收后清空，下一帧会立刻补写一次）
+    this.pingDefault = { slot: 'ct', at: 0 };
+    try {
+      // 空闲保活：Agent 发 ping、DO 自动回 pong，不会唤醒休眠中的 DO
+      if (typeof WebSocketRequestResponsePair !== 'undefined') ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair('ping', 'pong'));
+    } catch { /* 不支持就忽略：只是保活时多唤醒几次 */ }
+  }
+
+  viewers(except) { return this.ctx.getWebSockets('viewer').filter((w) => w !== except && w.readyState === WS_OPEN); }
+  agents() { return this.ctx.getWebSockets('agent').filter((w) => w.readyState === WS_OPEN); }
+  send(ws, o) { try { ws.send(typeof o === 'string' ? o : JSON.stringify(o)); } catch { /* 对方已断开 */ } }
+
+  async fetch(request) {
+    const url = new URL(request.url);
+    if (url.pathname === '/internal/ingest' && request.method === 'POST') {
+      const b = await request.json();
+      this.lastPersist.set(String(b.id || ''), Number(b.ts) || Date.now()); // 这次上报刚由 POST 写入过 D1，实时帧不必再写
+      await this.broadcast(String(b.id || ''), b.data || {}, Number(b.ts) || Date.now());
+      return json({ ok: true, viewers: this.viewers().length });
+    }
+    if (url.pathname === '/internal/status') {
+      return json({ viewers: this.viewers().length, agents: this.agents().map((w) => (w.deserializeAttachment() || {}).id).filter(Boolean) });
+    }
+    if ((request.headers.get('upgrade') || '').toLowerCase() !== 'websocket') return new Response('Expected WebSocket', { status: 426 });
+    const h = request.headers;
+    const role = h.get('x-hub-role'); // 这几个头由 Worker 在验证身份后设置，客户端传来的会被覆盖
+    let client;
+    if (role === 'agent') {
+      client = this.acceptAgent({ id: h.get('x-agent-id') || '', ver: h.get('x-agent-version') || '', region: h.get('x-hub-region') || '', interval: Math.min(5, Math.max(1, parseInt(h.get('x-hub-interval'), 10) || 2)) });
+    } else if (role === 'viewer') {
+      client = this.acceptViewer(h.get('x-hub-scope') || 'all');
+    } else {
+      return new Response('Bad request', { status: 400 });
+    }
+    return new Response(null, { status: 101, webSocket: client });
+  }
+
+  acceptAgent(att) {
+    const [client, server] = Object.values(new WebSocketPair());
+    for (const w of this.agents()) if ((w.deserializeAttachment() || {}).id === att.id) { try { w.close(1000, 'replaced'); } catch { /* 已关闭 */ } }
+    this.ctx.acceptWebSocket(server, ['agent']);
+    server.serializeAttachment(att);
+    this.send(server, { type: 'ready', active: this.viewers().length > 0, interval: att.interval });
+    return client;
+  }
+
+  acceptViewer(scope) {
+    const [client, server] = Object.values(new WebSocketPair());
+    const first = this.viewers().length === 0;
+    this.ctx.acceptWebSocket(server, ['viewer']);
+    server.serializeAttachment({ scope, ids: null });
+    this.send(server, { type: 'hello', ts: Date.now(), subscribed: scope });
+    if (first) this.setActive(true); // 第一个前端上线：通知所有 Agent 切到实时模式
+    return client;
+  }
+
+  setActive(on) {
+    for (const w of this.agents()) {
+      this.send(w, on ? { type: 'activate', interval: (w.deserializeAttachment() || {}).interval || 2 } : { type: 'deactivate' });
+    }
+  }
+
+  async getPingDefault() {
+    const now = Date.now();
+    if (now - this.pingDefault.at > 60000) {
+      this.pingDefault.at = now; // 先记下时间：读取失败也隔 60 秒再试，不会每帧都查
+      try { this.pingDefault.slot = (await loadSettings(this.env)).ping_default || 'ct'; } catch { /* 沿用旧值 */ }
+    }
+    return this.pingDefault.slot;
+  }
+
+  async broadcast(id, data, ts) {
+    const viewers = this.viewers();
+    if (!viewers.length || !id) return;
+    const slot = await this.getPingDefault();
+    const payload = JSON.stringify({
+      type: 'batchUpdate', ts: Date.now(),
+      updates: [{ serverId: id, samples: [{ ts, data: applyDefaultPing({ ...data, last_updated: ts }, slot) }] }],
+    });
+    for (const w of viewers) {
+      const a = w.deserializeAttachment() || { scope: 'all', ids: null };
+      if (a.scope !== 'all' && a.scope !== id) continue;
+      if (a.ids && !a.ids.includes(id)) continue;
+      this.send(w, payload);
+    }
+  }
+
+  async webSocketMessage(ws, message) {
+    let tags = [];
+    try { tags = this.ctx.getTags(ws); } catch { /* 已断开 */ }
+    if (tags.includes('agent')) return this.agentFrame(ws, message);
+    return this.viewerMessage(ws, message);
+  }
+
+  async agentFrame(ws, message) {
+    if (typeof message !== 'string' || message.length > 65536) return;
+    let msg;
+    try { msg = JSON.parse(message); } catch { return; }
+    if (!msg || msg.type !== 'metrics' || !msg.metrics || typeof msg.metrics !== 'object') return;
+    const att = ws.deserializeAttachment() || {};
+    if (!att.id) { try { ws.close(1008, 'unauthorized'); } catch { /* 已关闭 */ } return; }
+    const now = Date.now();
+    const data = normalizeMetrics(msg.metrics);
+    await this.broadcast(att.id, data, now);
+    if (now - (this.lastPersist.get(att.id) || 0) < HUB_PERSIST_MS) return;
+    this.lastPersist.set(att.id, now);
+    try {
+      const row = await this.env.DB.prepare('SELECT id, name, status_since, offline_notify_disabled FROM servers WHERE id = ?').bind(att.id).first();
+      if (!row) { try { ws.close(4404, 'Server not found'); } catch { /* 已关闭 */ } return; }
+      await persistReport(this.env, this.ctx, row, data, { region: att.region || '', version: att.ver || '', now });
+    } catch (e) {
+      this.lastPersist.delete(att.id); // 写库失败：下一帧再试
+      console.error('hub persist failed:', e?.message || e);
+    }
+  }
+
+  viewerMessage(ws, message) {
+    let msg;
+    try { msg = JSON.parse(String(message)); } catch { return; }
+    if (!msg || typeof msg !== 'object') return;
+    if (msg.type === 'ping') { this.send(ws, '{"type":"pong"}'); return; }
+    if (msg.type !== 'subscribe') return;
+    const cur = ws.deserializeAttachment() || { scope: 'all', ids: null };
+    const sc = msg.scope === undefined ? cur.scope : msg.scope;
+    const list = msg.ids;
+    const okScope = typeof sc === 'string' && (sc === 'all' || ID_RE.test(sc));
+    const okIds = list === undefined || (Array.isArray(list) && list.length <= 500 && list.every((x) => typeof x === 'string' && ID_RE.test(x)));
+    if (!okScope || !okIds) { try { ws.close(1008, 'Invalid subscription'); } catch { /* 已关闭 */ } return; }
+    // 连接附件最大 2KB：节点很多放不下时，当作订阅全部节点
+    const ids = sc === 'all' && Array.isArray(list) && JSON.stringify(list).length <= 1500 ? list : null;
+    ws.serializeAttachment({ scope: sc, ids });
+    this.send(ws, { type: 'subscribed', ts: Date.now(), subscribed: sc, count: Array.isArray(list) ? list.length : sc === 'all' ? 0 : 1 });
+  }
+
+  async webSocketClose(ws, code) {
+    let tags = [];
+    try { tags = this.ctx.getTags(ws); } catch { /* 已断开 */ }
+    try { ws.close(code >= 1000 && code < 5000 && ![1005, 1006, 1015].includes(code) ? code : 1000, 'closing'); } catch { /* 已关闭 */ }
+    if (tags.includes('viewer') && this.viewers(ws).length === 0) this.setActive(false); // 最后一个前端离开：Agent 退回 POST
+  }
+  async webSocketError(ws) { await this.webSocketClose(ws, 1011); }
+}
+
+// Agent 的 WebSocket 入口（GET /update + Upgrade）：Worker 先验证身份，再转给推送中心。
+async function handleAgentWs(request, env) {
+  if (!env.HUB) return fail('WebSocket not enabled', 503);
+  const bearer = /^Bearer\s+(.+)$/i.exec(request.headers.get('authorization') || '');
+  const id = request.headers.get('x-agent-id') || '';
+  if (!ID_RE.test(id)) return fail('Invalid server ID', 400);
+  if (!bearer || !(await safeEqual(bearer[1], env.API_SECRET))) return fail('Invalid secret', 401);
+  const row = await env.DB.prepare('SELECT id, extra FROM servers WHERE id = ?').bind(id).first();
+  if (!row) return fail('Server not found', 404);
+  const extra = safeJson(row.extra);
+  if (extra.connection_mode === 'http') return fail('WebSocket disabled for this server', 403);
+  const req = new Request(request);
+  req.headers.set('x-hub-role', 'agent');
+  req.headers.set('x-agent-id', id);
+  req.headers.set('x-agent-version', (request.headers.get('x-agent-version') || '').slice(0, 32));
+  req.headers.set('x-hub-region', request.cf?.country || request.headers.get('cf-ipcountry') || '');
+  req.headers.set('x-hub-interval', String(Math.min(5, Math.max(1, parseInt(extra.wss_report_interval, 10) || 2))));
+  return hubStub(env).fetch(req);
+}
+
 export default {
   async fetch(request, env, ctx) {
     if (!env.API_SECRET) return fail('API_SECRET is required', 400);
@@ -1612,8 +1935,8 @@ export default {
       if (request.method === 'OPTIONS') return new Response(null, { status: 204 });
       if (path === '/update') {
         if (request.method === 'POST') return await handleUpdate(request, env, ctx);
-        // Lite 不提供 WebSocket；Agent 安装时指定 -connection_mode=http，不会走到这里
-        return fail('WebSocket not enabled', 503);
+        if ((request.headers.get('upgrade') || '').toLowerCase() === 'websocket') return await handleAgentWs(request, env);
+        return fail('Method Not Allowed', 405);
       }
       if (path === '/api/ws' && request.method === 'GET') return await handleWs(request, env, url);
       if (path === '/admin/api') return await handleAdmin(request, env);

@@ -93,15 +93,20 @@ func main() {
 // run 是主循环：采集 -> 上报 -> 按 Worker 下发的间隔等待。
 func run(ctx context.Context, s settings) {
 	st := loadState(s.StatePath)
-	cfg := defaultConfig()
+	box := newCfgBox()
+	sh := &sharedData{}
 	rep := newReporter(s)
 	cfgMD5 := "none"
 	warnedICMP := false
 	failures := 0
 
+	// 实时推送：平时只保持一条空闲连接，有人在看时才高频推送；它失败不影响下面的 HTTP 上报
+	go runRealtime(ctx, s, box, st, sh)
+
 	for {
 		started := time.Now()
-		metrics := collectMetrics(ctx, cfg, st)
+		cfg := box.get()
+		metrics := collectMetrics(ctx, cfg, st, sh)
 		if ctx.Err() != nil {
 			return
 		}
@@ -125,8 +130,9 @@ func run(ctx context.Context, s settings) {
 					log.Printf("忽略无效的配置: %v", perr)
 				} else {
 					cfg = next
+					box.set(cfg)
 					cfgMD5 = md5Hex(res.Body) // Worker 对完整响应体计算 MD5，这里原样回传
-					log.Printf("已应用新配置：间隔 %s，重置日 %d，探测方式 %s", cfg.ReportInterval, cfg.ResetDay, cfg.PingMode)
+					log.Printf("已应用新配置：上报间隔 %s，重置日 %d，连接模式 %s", cfg.ReportInterval, cfg.ResetDay, cfg.ConnMode)
 					wait = cfg.ReportInterval
 				}
 			}

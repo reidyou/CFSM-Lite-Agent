@@ -18,6 +18,8 @@ type config struct {
 	ResetDay       int
 	Interface      string
 	PingMode       string
+	ConnMode       string        // auto：有人在看时实时推送，其余时间 HTTP POST；http：只用 HTTP POST
+	WSSInterval    time.Duration // 实时推送的间隔（1 到 5 秒）；实际以服务端通知的为准
 	Targets        map[string]string // ct、cu、cm、bd 四个探测目标
 }
 
@@ -29,6 +31,8 @@ func defaultConfig() config {
 		ReportInterval: 60 * time.Second,
 		ResetDay:       1,
 		PingMode:       "tcp",
+		ConnMode:       "auto",
+		WSSInterval:    2 * time.Second,
 		Targets: map[string]string{
 			"ct": "gd-ct-dualstack.ip.zstaticcdn.com",
 			"cu": "gd-cu-dualstack.ip.zstaticcdn.com",
@@ -91,6 +95,19 @@ func parseConfig(body string, cur config) (config, error) {
 			return cur, fmt.Errorf("ping_mode 无效: %q", v)
 		}
 		next.PingMode = v
+	}
+	if v := q.Get("connection_mode"); v != "" {
+		if v != "auto" && v != "http" {
+			return cur, fmt.Errorf("connection_mode 无效: %q", v)
+		}
+		next.ConnMode = v
+	}
+	if v := q.Get("wss_report_interval"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 || n > 5 {
+			return cur, fmt.Errorf("wss_report_interval 无效: %q", v)
+		}
+		next.WSSInterval = time.Duration(n) * time.Second
 	}
 	for _, k := range slotKeys {
 		if v := q.Get("custom_" + k); v != "" {

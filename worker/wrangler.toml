@@ -1,0 +1,30 @@
+# CFSM Lite 的 Worker 配置。
+# 用「GitHub 连接 Cloudflare 自动部署」时，Cloudflare 会读这个文件，把数据库、实时推送中心（Durable Object）和定时任务一起配置好。
+# 只需要改下面 database_id 这一处，其余不用动。
+
+name = "cfsm-lite"          # 必须和 Cloudflare 里现有的 Worker 名称一致
+main = "src/index.js"
+compatibility_date = "2026-10-01"
+
+# 保留你在 Cloudflare 网页上设置过的变量（IS_PUBLIC、AGENT_REPO、ADMIN_USERNAME 等）。
+# 密钥（API_SECRET、ADMIN_PASSWORD）本来就不会被覆盖。
+keep_vars = true
+
+[[d1_databases]]
+binding = "DB"
+database_name = "cfsm-lite"
+# 把下面换成你的 D1 数据库 ID：Cloudflare 控制台 → Storage & Databases → D1 → cfsm-lite，页面上的「Database ID」
+database_id = "把这里换成你的 D1 数据库 ID"
+
+# 实时推送中心：Agent 和 Monito 的 WebSocket 都连到它，它在内存里把数据转发给正在看的页面
+[[durable_objects.bindings]]
+name = "HUB"
+class_name = "Hub"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Hub"]   # 免费版只支持 SQLite 存储的 Durable Object
+
+# 每分钟检测一次离线、到期和流量提醒
+[triggers]
+crons = ["*/1 * * * *"]

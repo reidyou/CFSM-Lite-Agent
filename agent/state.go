@@ -4,8 +4,12 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 )
+
+// stMu 保护 state：HTTP 上报循环和实时推送协程都会更新当月累计流量。
+var stMu sync.Mutex
 
 // state 保存「当月累计流量」所需的最少信息，写在本地文件里，Agent 重启后可以接着累计。
 type state struct {
@@ -38,7 +42,9 @@ func (s *state) save(path string) error {
 	if path == "" {
 		return nil
 	}
+	stMu.Lock()
 	b, err := json.Marshal(s)
+	stMu.Unlock()
 	if err != nil {
 		return err
 	}
@@ -62,6 +68,8 @@ func delta(cur, last uint64) uint64 {
 
 // advance 用最新的网卡累计值更新当月累计流量。
 func (s *state) advance(rawRX, rawTX uint64, now time.Time, resetDay int, iface string) {
+	stMu.Lock()
+	defer stMu.Unlock()
 	if s.Iface != iface {
 		s.Iface = iface
 		s.Init = false
@@ -104,4 +112,11 @@ func periodKey(now time.Time, resetDay int) string {
 		start = time.Date(py, pm, day, 0, 0, 0, 0, loc)
 	}
 	return start.Format("2006-01-02")
+}
+
+// monthly 返回当前统计周期内累计的下行、上行字节数。
+func (s *state) monthly() (rx, tx uint64) {
+	stMu.Lock()
+	defer stMu.Unlock()
+	return s.RX, s.TX
 }

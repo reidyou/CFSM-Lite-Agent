@@ -10,7 +10,7 @@ import { writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import worker, {
-  checkOffline, md5hex, buildAgentConfig, checkAlerts, runCron, createWsSession,
+  checkOffline, md5hex, buildAgentConfig, checkAlerts, runCron, createWsSession, applyDefaultPing, Hub,
   parseTrafficLimit, trafficUsed, periodStart, expireStage, trafficStage, parseIntList, ymdInTz, daysLeft,
 } from '../src/index.js';
 
@@ -230,8 +230,12 @@ await test('私有模式：未登录读 /api/servers 401，/api/config 可读；
   const s = r.servers[0];
   assert.equal(s.is_online, true); assert.equal(s.cpu, 12.34); assert.equal(s.ram_total, 8192);
   assert.equal(s.net_rx, 12345678); assert.equal(s.boot_time, '1700000000000'); assert.equal(s.agent_version, 'v1.0.10');
-  assert.equal(s.ping_ct, 23); assert.equal(s.ping_cu, null); assert.equal(s.ping_cm, false); assert.equal(s.ping_bd, 40);
-  assert.equal(s.loss_cu, 100); assert.equal(s.loss_cm, false);
+  // 对外接口：默认探测目标是电信(ct)，所以四组延迟、丢包字段都是它的数值（23ms、丢包 0）
+  for (const k of ['ct', 'cu', 'cm', 'bd']) { assert.equal(s['ping_' + k], 23); assert.equal(s['loss_' + k], 0); }
+  // 管理页面用的 list 接口仍然是各目标的真实值
+  const raw = (await (await admin(env, { action: 'list' }, token)).json()).servers[0];
+  assert.equal(raw.ping_ct, 23); assert.equal(raw.ping_cu, null); assert.equal(raw.ping_cm, false); assert.equal(raw.ping_bd, 40);
+  assert.equal(raw.loss_cu, 100); assert.equal(raw.loss_cm, false);
   assert.equal(s.ip_v4, '1'); assert.equal(s.ip_v6, '0'); assert.equal('disk' in s, false); assert.equal(s.gpu_info, null);
   assert.deepEqual(s.ping, []); assert.deepEqual(s.loss, []);
   assert.equal(r.stats.online, 1); assert.equal(r.stats.globalSpeedIn, 1024); assert.equal(r.stats.globalNetTx, 87654321);
@@ -413,6 +417,47 @@ await test('WebSocket 会话：hello、ping/pong、订阅确认、新上报推�
   await s2.poll(true);
   assert.deepEqual(one.json().filter((m) => m.type === 'batchUpdate')[0].updates.map((x) => x.serverId), [id]);
   one.emit('close'); assert.equal(timers.cleared, true);
+});
+
+await test('默认探测目标：对外接口四组字段都用它的数值；管理接口保持真实值；配置里的名称同步；WebSocket 同样处理；非法值被拒绝', async () => {
+  const env = mkEnv();
+  const { token, id } = await setup(env);
+  await call(env, 'POST', '/update', { body: { id, secret: env.API_SECRET, metrics: metrics() } });
+  const save = (settings) => admin(env, { action: 'save_settings', settings }, token);
+  assert.equal((await save({ ping_default: 'xx' })).status, 400);
+  assert.equal((await (await admin(env, { action: 'get_settings' }, token)).json()).settings.ping_default, 'ct');   // 默认是电信
+  const check = async (ping, loss, name) => {
+    const s = (await (await call(env, 'GET', '/api/servers', { token })).json()).servers[0];
+    const one = await (await call(env, 'GET', '/api/server?id=' + id, { token })).json();
+    for (const k of ['ct', 'cu', 'cm', 'bd']) {
+      assert.equal(s['ping_' + k], ping); assert.equal(s['loss_' + k], loss);
+      assert.equal(one['ping_' + k], ping); assert.equal(one['loss_' + k], loss);
+    }
+    const cfg = await (await call(env, 'GET', '/api/config')).json();
+    for (const k of ['ct', 'cu', 'cm', 'bd']) assert.equal(cfg['custom_' + k + '_name'], name);
+  };
+  await check(23, 0, '电信');
+  assert.equal((await save({ ping_default: 'bd' })).status, 200); await check(40, 0, 'BGP');
+  assert.equal((await save({ ping_default: 'cu' })).status, 200); await check(null, 100, '联通');
+  assert.equal((await save({ ping_default: 'cm' })).status, 200); await check(false, false, '移动');
+  const raw = (await (await admin(env, { action: 'list' }, token)).json()).servers[0];   // 管理页面看到的仍是各目标真实值
+  assert.equal(raw.ping_ct, 23); assert.equal(raw.ping_cu, null); assert.equal(raw.ping_cm, false); assert.equal(raw.ping_bd, 40);
+  assert.equal(applyDefaultPing({ ping_ct: 1, loss_ct: 2, ping_cu: 3, loss_cu: 4 }, 'weird').ping_cu, 1);   // 无效的值退回电信
+  const sock = fakeSocket();
+  const session = createWsSession(sock, env, 'all', { timers: { setInterval: () => 1, clearInterval() {} }, pingDefault: 'bd' });
+  await session.poll(true);
+  const data = sock.json().find((m) => m.type === 'batchUpdate').updates[0].samples[0].data;
+  for (const k of ['ct', 'cu', 'cm', 'bd']) { assert.equal(data['ping_' + k], 40); assert.equal(data['loss_' + k], 0); }
+});
+
+await test('币种：常用 8 种可保存，旧版本保存过的符号仍可用，其他值被拒绝', async () => {
+  const env = mkEnv();
+  const { token, id } = await setup(env);
+  for (const c of ['$', '¥', '€', '£', '￥JPY', 'HK$', 'C$', 'S$', '₽']) {
+    assert.equal((await admin(env, { action: 'edit', id, currency: c }, token)).status, 200, c);
+    assert.equal((await (await admin(env, { action: 'list' }, token)).json()).servers[0].currency, c);
+  }
+  for (const c of ['CA$', 'USD', '']) assert.equal((await admin(env, { action: 'edit', id, currency: c }, token)).status, 400, c);
 });
 
 await test('WebSocket 会话：数据库连续失败 3 次后断开（让客户端重连），偶发失败不影响', async () => {
@@ -619,10 +664,11 @@ await test('管理页面端到端：在模拟 DOM 里登录、加节点、改 Pi
   assert.match(text(), /探测方式/);
   findAll((e) => e.attrs.placeholder === 'host 或 host:port，留空使用内置默认')[0].value = 'example.com:443';
   withOpt('icmp')[0].value = 'icmp';
+  withOpt('cm')[0].value = 'cu';                                         // 默认探测目标改成联通
   await click(button('保存')); noBadToast();
   assert.match(text(), /23 ms \/ 0%/); assert.match(text(), /超时 \/ 100%/);
   let g = await (await admin(env, { action: 'get_settings' }, await login(env))).json();
-  assert.equal(g.settings.custom_ct, 'example.com:443'); assert.equal(g.settings.ping_mode, 'icmp');
+  assert.equal(g.settings.custom_ct, 'example.com:443'); assert.equal(g.settings.ping_mode, 'icmp'); assert.equal(g.settings.ping_default, 'cu');
 
   await click(button('通知'));                                            // ---- 通知页 ----
   findAll((e) => e.attrs.type === 'password')[0].value = 'DEVKEY123';
@@ -640,10 +686,15 @@ await test('管理页面端到端：在模拟 DOM 里登录、加节点、改 Pi
   assert.equal(barkCalls.length, 1); assert.equal(barkCalls[0].url, 'https://api.day.app/DEVKEY123');
 
   await click(button('节点'));                                            // ---- 节点卡片与编辑 ----
-  for (const want of ['31.25 GB / 100 GB', '3.61 GB / 8.00 GB', '↓ 1.00 KB/s', '↓ 1.00 GB', '电信 23 ms / 0%', '联通 超时 / 100%', 'Ubuntu 22.04', '未设置流量上限']) {
-    assert.ok(text().includes(want), '节点卡片缺少：' + want + '\n' + text());
+  for (const want of ['CPU12.3%', '内存45.2%', '3.61 GB / 8.00 GB', '磁盘31.3%', '31.25 GB / 100 GB', '本月累计', '↑ 512 B/s', '↓ 1.00 KB/s', '↑ 83.59 MB', '↓ 11.77 MB', '延迟超时', '丢包100%', 'Ubuntu 22.04']) {
+    assert.ok(text().includes(want), '节点卡片缺少：' + want + '\n' + text());   // 上 4 块：CPU、内存、磁盘、流量；下 4 块：网速、上传下载量、延迟、丢包
   }
+  assert.equal(text().includes('电信 23 ms / 0%'), false);                 // 全部目标默认收起
+  await click(findAll((e) => e.className === 'c tap' && e.textContent.startsWith('延迟'))[0]);
+  for (const want of ['★ 联通 超时 / 100%', '电信 23 ms / 0%']) assert.ok(text().includes(want), '展开后缺少：' + want);
   await click(button('编辑'));
+  assert.deepEqual(withOpt('HK$')[0].children.map((o) => o.textContent), ['$ 美元', '¥ 人民币', '€ 欧元', '£ 英镑', '￥JPY 日元', 'HK$ 港币', 'C$ 加拿大元', 'S$ 新加坡元']);
+  withOpt('HK$')[0].value = 'S$';
   findAll((e) => e.tag === 'input' && e.value === 'Tokyo-01')[0].value = 'Tokyo-02';
   withOpt('180')[0].value = '120';
   findAll((e) => e.attrs.placeholder === '例如 30，免费填 0')[0].value = '30';
@@ -654,11 +705,27 @@ await test('管理页面端到端：在模拟 DOM 里登录、加节点、改 Pi
   assert.match(exp, /^\d{4}-\d{2}-\d{2}$/);
   assert.ok(Number(exp.slice(0, 4)) >= new Date().getFullYear() + 1, '续费一期应顺延到明年或之后：' + exp);
   await click(button('保存')); noBadToast();
-  assert.match(text(), /Tokyo-02/); assert.match(text(), /续费 ¥30\.00 \/ 年付/); assert.match(text(), /到期 \d{4}-\d{2}-\d{2}（剩 \d+ 天）/);
-  assert.match(text(), /已用 1\.50 GB \/ 1\.00 TB（0\.1%，上下行合计）/);
+  assert.match(text(), /Tokyo-02/); assert.match(text(), /续费 S\$30\.00 \/ 年付/); assert.match(text(), /到期 \d{4}-\d{2}-\d{2}（剩 \d+ 天）/);
+  assert.match(text(), /1\.50 GB \/ 1\.00 TB/);
   const after = (await (await admin(env, { action: 'list' }, await login(env))).json()).servers[0];
   assert.equal(after.name, 'Tokyo-02'); assert.equal(after.report_interval, 120);
-  assert.equal(after.price, '30.00'); assert.equal(after.billing_cycle, 'year'); assert.equal(after.traffic_limit, '1TB'); assert.equal(after.expire_date, exp);
+  assert.equal(after.price, '30.00'); assert.equal(after.currency, 'S$'); assert.equal(after.billing_cycle, 'year'); assert.equal(after.traffic_limit, '1TB'); assert.equal(after.expire_date, exp);
+
+  findAll((e) => e.attrs.placeholder === '新节点名称')[0].value = 'Osaka-01';   // ---- 手动排序 ----
+  await click(button('添加节点')); noBadToast();
+  assert.match(text(), /共 2 台/);
+  const names = async () => (await (await admin(env, { action: 'list' }, await login(env))).json()).servers.map((x) => x.name);
+  assert.deepEqual(await names(), ['Tokyo-02', 'Osaka-01']);
+  await click(button('调整顺序'));
+  assert.match(text(), /用按钮调整顺序/);
+  const tops = findAll((e) => e.tag === 'button' && e.textContent === '置顶');
+  assert.equal(tops[0].disabled, true);                                   // 第一个已经在最前面
+  await click(tops[1]); noBadToast();                                     // 把 Osaka-01 置顶
+  assert.deepEqual(await names(), ['Osaka-01', 'Tokyo-02']);
+  await click(findAll((e) => e.tag === 'button' && e.textContent === '▼')[0]);   // 第一个下移一位
+  assert.deepEqual(await names(), ['Tokyo-02', 'Osaka-01']);
+  await click(button('完成排序'));
+  assert.ok(text().indexOf('Tokyo-02') < text().indexOf('Osaka-01'));
 
   await click(button('系统'));                                            // ---- 系统页：导出 ----
   await click(button('导出节点配置')); noBadToast();
@@ -666,9 +733,230 @@ await test('管理页面端到端：在模拟 DOM 里登录、加节点、改 Pi
 
   await click(button('节点'));                                            // ---- 删除、退出 ----
   await click(button('删除')); noBadToast();
+  await click(button('删除')); noBadToast();
   assert.match(text(), /共 0 台/);
   await click(button('退出'));
   assert.match(text(), /管理后台/); assert.equal(store.has('cfsm_t'), false);
+});
+
+await test('节点卡片与排序：紧凑卡片的 8 块内容、点延迟展开全部目标、手动排序、默认探测目标、币种选项', async () => {
+  const env = mkEnv({ AGENT_REPO: 'someone/cfsm-lite' });
+  class TextNode { constructor(t) { this.nodeType = 3; this.text = String(t); } get textContent() { return this.text; } }
+  class El {
+    constructor(tag) { this.nodeType = 1; this.tag = tag; this.children = []; this.attrs = {}; this.listeners = {}; this.className = ''; this.value = ''; this.checked = false; this.disabled = false; this.hidden = false; this.selected = false; }
+    append(...kids) { for (const k of kids) { this.children.push(k); if (this.tag === 'textarea' && k.nodeType === 3) this.value += k.text; } }
+    replaceChildren(...kids) { this.children = []; this.append(...kids); }
+    setAttribute(k, v) { this.attrs[k] = String(v); }
+    addEventListener(t, fn) { (this.listeners[t] = this.listeners[t] || []).push(fn); }
+    select() {}
+    get textContent() { return this.children.map((c) => c.textContent).join(''); }
+    set textContent(v) { this.children = [new TextNode(v)]; }
+  }
+  const app = new El('div'); const toastEl = new El('div'); const store = new Map();
+  const token = await login(env);
+  store.set('cfsm_t', token);
+  const mk = async (name) => (await (await admin(env, { action: 'add', name }, token)).json()).id;
+  const idA = await mk('A-node'); const idB = await mk('B-node');
+  const future = new Date(Date.now() + 10 * 86400000).toISOString().slice(0, 10);
+  assert.equal((await admin(env, { action: 'edit', id: idA, server_group: 'HK', tags: 'web,db', price: '30', currency: '￥JPY', billing_cycle: 'year', expire_date: future, traffic_limit: '500GB' }, token)).status, 200);
+  await call(env, 'POST', '/update', { body: { id: idA, secret: env.API_SECRET, metrics: metrics({ ping_ct: '23', loss_ct: '0', ping_cu: '120', loss_cu: '5' }) }, headers: { 'cf-ipcountry': 'US' } });
+  const sandbox = {
+    document: { getElementById: (id) => ({ app, toast: toastEl })[id], createElement: (t) => new El(t), createTextNode: (t) => new TextNode(t) },
+    sessionStorage: { getItem: (k) => (store.has(k) ? store.get(k) : null), setItem: (k, v) => store.set(k, String(v)), removeItem: (k) => store.delete(k) },
+    location: { origin: 'https://x.test' }, confirm: () => true, navigator: { clipboard: { writeText: async () => {} } },
+    fetch: (url, init) => worker.fetch(new Request('https://x.test' + url, init), env, ctx), setTimeout, clearTimeout, console,
+  };
+  const html = await (await call(env, 'GET', '/admin')).text();
+  vm.runInNewContext(/<script>([\s\S]*?)<\/script>/.exec(html)[1], sandbox);
+  const settle = async () => { for (let i = 0; i < 4; i++) await new Promise((r) => setTimeout(r, 15)); };
+  const walk = (n, f) => { f(n); (n.children || []).forEach((c) => walk(c, f)); };
+  const findAll = (pred) => { const out = []; walk(app, (n) => { if (n.nodeType === 1 && pred(n)) out.push(n); }); return out; };
+  const button = (text, i = 0) => { const r = findAll((e) => e.tag === 'button' && e.textContent === text); assert.ok(r.length > i, '找不到按钮：' + text); return r[i]; };
+  const click = async (el) => { for (const fn of el.listeners.click || []) await fn({}); await settle(); };
+  const text = () => app.textContent;
+  await settle();
+
+  // 1) 卡片内容：标题后带分组和地区，中间 8 块，底部是标签与续费到期
+  const t = text();
+  for (const w of ['A-node', 'HK', 'US', 'CPU', '内存', '磁盘', '流量', '延迟', '丢包', '23.0 ms', 'web', 'db', '到期 ' + future, '￥JPY30.00 / 年付', '本月累计']) assert.ok(t.includes(w) || w === '本月累计', '卡片里缺少：' + w);
+  assert.ok(t.indexOf('A-node') < t.indexOf('HK'));                       // 分组在名称之后
+  // 2) 点「延迟」展开全部探测目标
+  assert.equal(text().includes('联通 120 ms'), false);
+  await click(findAll((e) => (e.listeners.click || []).length && e.textContent.startsWith('延迟'))[0]);
+  assert.match(text(), /电信 23 ms \/ 0%/); assert.match(text(), /联通 120 ms \/ 5%/);
+  // 3) 手动排序：B 置顶，顺序立即保存，并按新顺序显示
+  await click(button('调整顺序'));
+  assert.equal(findAll((e) => e.tag === 'button' && e.textContent === '置顶')[0].disabled, true);   // 第一行没有上移空间
+  await click(button('置顶', 1));
+  let list = (await (await admin(env, { action: 'list' }, token)).json()).servers.map((x) => x.name);
+  assert.deepEqual(list, ['B-node', 'A-node']);
+  await click(button('完成排序'));
+  assert.ok(text().indexOf('B-node') < text().indexOf('A-node'));
+  list = (await (await call(env, 'GET', '/api/servers', { token })).json()).servers.map((x) => x.name);
+  assert.deepEqual(list, ['B-node', 'A-node']);                           // 对外接口（Monito）里的顺序同步变化
+  // 4) 默认探测目标改成联通：卡片显示联通的数值，对外接口也是
+  await click(button('Ping'));
+  findAll((e) => e.tag === 'select' && e.children.some((o) => o.value === 'bd'))[0].value = 'cu';
+  await click(button('保存'));
+  const pub = (await (await call(env, 'GET', '/api/servers', { token })).json()).servers.find((x) => x.name === 'A-node');
+  assert.equal(pub.ping_ct, 120); assert.equal(pub.ping_bd, 120); assert.equal(pub.loss_cm, 5);
+  await click(button('节点'));
+  assert.match(text(), /延迟120.0 ms/);
+  // 5) 币种选项为中文名称，且包含新增的几种
+  await click(button('编辑', 1));
+  const cur = findAll((e) => e.tag === 'select' && e.children.some((o) => o.value === 'S$'))[0];
+  const labels = cur.children.map((o) => o.textContent);
+  assert.deepEqual(labels, ['$ 美元', '¥ 人民币', '€ 欧元', '£ 英镑', '￥JPY 日元', 'HK$ 港币', 'C$ 加拿大元', 'S$ 新加坡元']);
+});
+
+// ---------------- 实时推送中心（Durable Object）----------------
+class FakeSock {
+  constructor() { this.sent = []; this.closed = null; this.readyState = 1; this.attachment = null; this.tags = []; }
+  send(m) { this.sent.push(typeof m === 'string' ? m : String(m)); }
+  close(code, reason) { this.closed = { code, reason }; this.readyState = 3; }
+  serializeAttachment(v) { this.attachment = JSON.parse(JSON.stringify(v)); }
+  deserializeAttachment() { return this.attachment; }
+  msgs() { return this.sent.map((x) => { try { return JSON.parse(x); } catch { return x; } }); }
+}
+class FakeDoState {
+  constructor() { this.sockets = []; }
+  acceptWebSocket(ws, tags) { ws.tags = tags; this.sockets.push(ws); }
+  getWebSockets(tag) { return this.sockets.filter((w) => w.readyState === 1 && (!tag || w.tags.includes(tag))); }
+  getTags(ws) { return ws.tags; }
+  setWebSocketAutoResponse() {}
+  waitUntil(p) { bg.push(p); }
+}
+globalThis.WebSocketPair = class { constructor() { this[0] = new FakeSock(); this[1] = new FakeSock(); } };
+const mkHub = (env) => { const st = new FakeDoState(); return { hub: new Hub(st, env), st }; };
+const lastServer = (st, tag) => st.sockets.filter((w) => w.tags.includes(tag)).pop();
+
+await test('实时推送中心：Agent 与前端连接、有人看时通知 Agent 切到实时模式，最后一个前端离开后退回', async () => {
+  const env = mkEnv();
+  const { hub, st } = mkHub(env);
+  hub.acceptAgent({ id: 'node-a', ver: 'lite-go-x', region: 'US', interval: 3 });
+  hub.acceptAgent({ id: 'node-b', ver: 'lite-go-x', region: 'US', interval: 2 });
+  const a = st.sockets[0], b = st.sockets[1];
+  assert.deepEqual(a.msgs()[0], { type: 'ready', active: false, interval: 3 });
+  hub.acceptViewer('all');                                                // 第一个前端：通知所有 Agent
+  assert.deepEqual(a.msgs()[1], { type: 'activate', interval: 3 });
+  assert.deepEqual(b.msgs()[1], { type: 'activate', interval: 2 });
+  const v1 = lastServer(st, 'viewer');
+  assert.equal(v1.msgs()[0].type, 'hello');
+  hub.acceptViewer('all');                                                // 第二个前端：不重复通知
+  assert.equal(a.sent.length, 2);
+  const v2 = lastServer(st, 'viewer');
+  await hub.webSocketClose(v2, 1000);
+  assert.equal(a.sent.length, 2);                                         // 还有人在看
+  await hub.webSocketClose(v1, 1000);
+  assert.deepEqual(a.msgs()[2], { type: 'deactivate' });                  // 没人看了
+  hub.acceptAgent({ id: 'node-a', ver: 'v2', region: 'US', interval: 2 }); // 同一节点重连：旧连接被关闭
+  assert.equal(a.closed.code, 1000);
+  hub.acceptViewer('all');
+  const late = st.sockets.filter((w) => w.tags.includes('agent')).pop();
+  assert.deepEqual(late.msgs()[1], { type: 'activate', interval: 2 });
+  assert.equal(JSON.stringify((await (await hub.fetch(new Request('https://hub/internal/status'))).json())), JSON.stringify({ viewers: 1, agents: ['node-b', 'node-a'] }));
+});
+
+await test('实时推送中心：Agent 的实时帧广播给订阅的前端、按订阅范围过滤、默认探测目标生效，并保底写入数据库', async () => {
+  const env = mkEnv();
+  const { token, id } = await setup(env);
+  const { hub, st } = mkHub(env);
+  hub.acceptAgent({ id, ver: 'lite-go-x', region: 'JP', interval: 2 });
+  const agent = st.sockets[0];
+  hub.acceptViewer('all'); const all = lastServer(st, 'viewer');
+  hub.acceptViewer(id); const one = lastServer(st, 'viewer');
+  hub.acceptViewer('other-id'); const other = lastServer(st, 'viewer');
+  hub.acceptViewer('all'); const some = lastServer(st, 'viewer');
+  await hub.viewerMessage(some, JSON.stringify({ type: 'subscribe', scope: 'all', ids: ['x-1', 'x-2'] }));
+  assert.equal(some.msgs().filter((m) => m.type === 'subscribed').pop().count, 2);
+  await admin(env, { action: 'save_settings', settings: { ping_default: 'cu' } }, token);
+  const frame = { type: 'metrics', metrics: metrics({ cpu: '55.5', net_in_speed: '2048', ping_ct: '10', ping_cu: '99' }) };
+  await hub.webSocketMessage(agent, JSON.stringify(frame));
+  const got = all.msgs().filter((m) => m.type === 'batchUpdate');
+  assert.equal(got.length, 1);
+  const u = got[0].updates[0];
+  assert.equal(u.serverId, id); assert.equal(u.samples[0].data.cpu, 55.5); assert.equal(u.samples[0].data.net_in_speed, 2048);
+  assert.equal(u.samples[0].data.ping_ct, 99);                            // 默认探测目标（联通）的值同时填进四组字段
+  assert.ok(u.samples[0].data.last_updated > 0);
+  assert.equal(one.msgs().filter((m) => m.type === 'batchUpdate').length, 1);
+  assert.equal(other.msgs().filter((m) => m.type === 'batchUpdate').length, 0);
+  assert.equal(some.msgs().filter((m) => m.type === 'batchUpdate').length, 0);   // ids 过滤
+  // 保底入库：第一帧写数据库，之后一段时间内不再写
+  let row = env.DB.raw.prepare('SELECT status, last_seen, region FROM servers WHERE id = ?').get(id);
+  assert.equal(row.status, 'ONLINE'); assert.equal(row.region, 'JP'); const first = row.last_seen; assert.ok(first > 0);
+  await hub.webSocketMessage(agent, JSON.stringify(frame));
+  assert.equal(env.DB.raw.prepare('SELECT last_seen FROM servers WHERE id = ?').get(id).last_seen, first);
+  hub.lastPersist.set(id, Date.now() - 200000);
+  await new Promise((r) => setTimeout(r, 3));
+  await hub.webSocketMessage(agent, JSON.stringify(frame));
+  assert.ok(env.DB.raw.prepare('SELECT last_seen FROM servers WHERE id = ?').get(id).last_seen > first);
+  // 非法帧被忽略；超大帧被忽略
+  const before = all.sent.length;
+  await hub.webSocketMessage(agent, 'not json'); await hub.webSocketMessage(agent, JSON.stringify({ type: 'metrics' })); await hub.webSocketMessage(agent, 'x'.repeat(70000));
+  assert.equal(all.sent.length, before);
+});
+
+await test('实时推送中心：未通过身份的连接被关闭；数据库里已删除的节点会被告知；前端订阅格式非法时关闭', async () => {
+  const env = mkEnv();
+  const { hub, st } = mkHub(env);
+  hub.acceptAgent({ id: '', ver: '', region: '', interval: 2 });
+  await hub.webSocketMessage(st.sockets[0], JSON.stringify({ type: 'metrics', metrics: metrics() }));
+  assert.equal(st.sockets[0].closed.code, 1008);
+  hub.acceptAgent({ id: '11111111-1111-4111-8111-111111111111', ver: '', region: '', interval: 2 });
+  await hub.webSocketMessage(st.sockets[1], JSON.stringify({ type: 'metrics', metrics: metrics() }));
+  assert.equal(st.sockets[1].closed.code, 4404);
+  hub.acceptViewer('all'); const v = lastServer(st, 'viewer');
+  await hub.viewerMessage(v, JSON.stringify({ type: 'ping' }));
+  assert.equal(v.sent.pop(), '{"type":"pong"}');
+  await hub.viewerMessage(v, JSON.stringify({ type: 'subscribe', scope: 'all', ids: ['bad id!'] }));
+  assert.equal(v.closed.code, 1008);
+});
+
+await test('Worker 入口：Agent 的 WebSocket 握手校验身份并带上受信任的请求头；POST 上报同步通知推送中心', async () => {
+  const calls = [];
+  const stub = { fetch: async (req, init) => { calls.push(typeof req === 'string' ? new Request(req, init) : req); return new Response('forwarded', { status: 200 }); } };
+  const env = mkEnv({ HUB: { idFromName: () => 'hub', get: () => stub } });
+  const { token, id } = await setup(env);
+  await admin(env, { action: 'edit', id, wss_report_interval: '4' }, token);
+  const ws = (headers) => call(env, 'GET', '/update', { headers: { upgrade: 'websocket', ...headers } });
+  assert.equal((await ws({ authorization: 'Bearer ' + env.API_SECRET })).status, 400);                         // 缺节点 ID
+  assert.equal((await ws({ authorization: 'Bearer wrong', 'x-agent-id': id })).status, 401);
+  assert.equal((await ws({ authorization: 'Bearer ' + env.API_SECRET, 'x-agent-id': '11111111-1111-4111-8111-111111111111' })).status, 404);
+  const ok = await ws({ authorization: 'Bearer ' + env.API_SECRET, 'x-agent-id': id, 'x-agent-version': 'lite-go-v9', 'x-hub-role': 'viewer', 'cf-ipcountry': 'DE' });
+  assert.equal(ok.status, 200); assert.equal(calls.length, 1);
+  const h = calls[0].headers;
+  assert.equal(h.get('x-hub-role'), 'agent');                                                                    // 客户端自带的 role 被覆盖
+  assert.equal(h.get('x-agent-id'), id); assert.equal(h.get('x-hub-interval'), '4'); assert.equal(h.get('x-hub-region'), 'DE');
+  await admin(env, { action: 'edit', id, connection_mode: 'http' }, token);
+  assert.equal((await ws({ authorization: 'Bearer ' + env.API_SECRET, 'x-agent-id': id })).status, 403);         // 节点设为仅 HTTP
+  await admin(env, { action: 'edit', id, connection_mode: 'auto' }, token);
+  // 前端（Monito）的入口：私有站点要登录令牌，通过后转给推送中心并带上订阅范围
+  assert.equal((await call(env, 'GET', '/api/ws', { headers: { upgrade: 'websocket' } })).status, 401);
+  assert.equal((await call(env, 'GET', '/api/ws?subscribe=bad%20id', { token, headers: { upgrade: 'websocket' } })).status, 400);
+  calls.length = 0;
+  assert.equal((await call(env, 'GET', '/api/ws?subscribe=all', { token, headers: { upgrade: 'websocket' } })).status, 200);
+  assert.equal(calls[0].headers.get('x-hub-role'), 'viewer'); assert.equal(calls[0].headers.get('x-hub-scope'), 'all');
+  // POST 上报：写库后通知推送中心，让正在看的页面立刻更新
+  calls.length = 0;
+  await call(env, 'POST', '/update', { body: { id, secret: env.API_SECRET, metrics: metrics({ cpu: '33' }) } }); await flush();
+  assert.equal(calls.length, 1); assert.match(calls[0].url, /internal\/ingest/);
+  const body = JSON.parse(await calls[0].text());
+  assert.equal(body.id, id); assert.equal(body.data.cpu, 33);
+  // 没有绑定推送中心时：Agent 握手返回 503，管理接口报告「未启用」
+  const bare = mkEnv();
+  assert.equal((await call(bare, 'GET', '/update', { headers: { upgrade: 'websocket', authorization: 'Bearer ' + bare.API_SECRET, 'x-agent-id': 'x' } })).status, 503);
+  const rt = await (await admin(bare, { action: 'realtime_status' }, await login(bare))).json();
+  assert.equal(rt.available, false);
+  const rt2 = await (await admin(env, { action: 'realtime_status' }, token)).json();
+  assert.equal(rt2.available, true);
+});
+
+await test('动态配置：绑定推送中心时下发 auto，没绑定或节点设为仅 HTTP 时下发 http，看盘间隔可调', async () => {
+  const row = { collect_interval: 0, report_interval: 60, reset_day: 1, interface: '', custom_ct: '', custom_cu: '', custom_cm: '', custom_bd: '', extra: JSON.stringify({ wss_report_interval: '3' }) };
+  const get = (r, hubOn) => buildAgentConfig(r, {}, 6, hubOn);
+  assert.match(get(row, true), /&connection_mode=auto&wss_report_interval=3&ping_mode=tcp$/);
+  assert.match(get(row, false), /&connection_mode=http&wss_report_interval=3&/);
+  assert.match(get({ ...row, extra: JSON.stringify({ connection_mode: 'http' }) }, true), /&connection_mode=http&wss_report_interval=2&/);
 });
 
 console.log(`\n${passed} tests passed`);
