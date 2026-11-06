@@ -236,7 +236,7 @@ Agent 本地只有三项必需配置：上报地址、节点 ID、上报密钥�
 | `net_rx`、`net_tx` | 网卡累计下行与上行，字节 |
 | `net_rx_monthly`、`net_tx_monthly` | 当月累计下行与上行，字节 |
 | `net_in_speed`、`net_out_speed` | 实时下行与上行速率，字节每秒 |
-| `os`、`arch`、`kernel_version`、`cpu_info`、`cpu_cores` | 系统、架构（x86_64 或 aarch64）、内核版本、CPU 型号、逻辑核心数。系统名取自 `/etc/os-release` 的 `PRETTY_NAME`；Debian 例外，会读 `/etc/debian_version` 补上小版本号，显示为 `Debian 13.1 (trixie)` |
+| `os`、`arch`、`kernel_version`、`cpu_info`、`cpu_cores` | 系统、架构（x86_64 或 aarch64）、内核版本、CPU 型号、逻辑核心数。系统名取自 `/etc/os-release` 的 `PRETTY_NAME`；Debian 例外，会读 `/etc/debian_version` 补上小版本号，显示为 `Debian 13.1`（管理页再拼上架构：`Debian 13.1 (x86_64)`） |
 | `processes`、`tcp_conn`、`udp_conn` | 进程数、TCP 连接数、UDP 套接字数 |
 | `ip_v4`、`ip_v6` | 有无到公网的 IPv4、IPv6 路由，`1` 或 `0` |
 | `ping_ct`、`ping_cu`、`ping_cm`、`ping_bd` | 四个目标的延迟，毫秒；`null` 表示全部超时；`false` 表示未配置 |
