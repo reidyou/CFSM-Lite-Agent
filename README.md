@@ -132,7 +132,7 @@ curl -fsSL https://raw.githubusercontent.com/用户名/CFSM-Lite-Agent/main/inst
 3. 把程序放到 `/opt/cfsm-lite/cfsm-lite-agent`。
 4. 把上报地址、节点 ID、密钥写入 `/opt/cfsm-lite/agent.env`，文件权限 600，只有 root 能读。
 5. 创建 systemd 服务 `cfsm-lite-agent` 并启动。服务以临时的低权限用户运行（`DynamicUser`），并开启这些保护：`NoNewPrivileges`、`ProtectSystem=strict`、`ProtectHome=read-only`、`PrivateTmp`、不授予任何额外权限（`CapabilityBoundingSet` 为空）。`ProtectHome` 用只读而不是完全隐藏，是为了让单独挂载在 `/home` 的磁盘也能被统计到。
-6. 当月流量的累计状态保存在 `/var/lib/cfsm-lite/state.json`（由 systemd 的 `StateDirectory` 管理）。
+6. 当月流量的累计状态保存在 `/var/lib/cfsm-lite/state.json`（由 systemd 的 `StateDirectory` 管理）。同一个文件里还保存着最近一次从 Worker 收到的配置（重置日、重置时刻、时区、统计网卡等），所以重启服务或重新执行安装命令升级后，Agent 会先按这份配置接着累计，不会因为尚未连上 Worker 而用默认值把当月流量清零。
 
 ### 4.5 日常管理
 
@@ -216,7 +216,7 @@ Agent 本地只有三项必需配置：上报地址、节点 ID、上报密钥�
 - **流量**：读取 `/proc/net/dev`。默认汇总所有网卡，排除 `lo`、`docker`、`veth`、`br-`、`virbr`、`cni`、`flannel`、`kube`、`cali` 开头的虚拟网卡；可由「统计网卡」指定。
   - 累计上下行（`net_rx`、`net_tx`）是网卡计数器的原始值；
   - 实时网速由两次读数的差值除以间隔得到，计数器回绕或网卡重置时按 0 处理，不会出现负数；
-  - **当月流量**由 Agent 按「每月流量重置日」累计，保存在 `/var/lib/cfsm-lite/state.json`，重启后接着累计；Agent 停止运行期间产生的流量，会在下次启动时补上（计数器没有被重置的话）。**从安装那一刻开始累计，不包含安装之前的流量**。重置日大于当月天数时取当月最后一天；统计周期按服务端设置的时区（默认 `Asia/Shanghai`）和重置时刻（默认 0 点 0 分）划分，与服务器本机时区无关；更换统计网卡会重新建立基线；修改重置日、重置时刻后当前周期的累计会从 0 重新开始，需要的话可以在服务端用「手动校准」补回。
+  - **当月流量**由 Agent 按「每月流量重置日」累计，保存在 `/var/lib/cfsm-lite/state.json`，重启或重新执行安装命令升级后接着累计（累计状态每 30 秒和退出时落盘）；Agent 停止运行期间产生的流量，会在下次启动时补上（计数器没有被重置的话）。**从安装那一刻开始累计，不包含安装之前的流量**。重置日大于当月天数时取当月最后一天；统计周期按服务端设置的时区（默认 `Asia/Shanghai`）和重置时刻（默认 0 点 0 分）划分，与服务器本机时区无关；更换统计网卡会重新建立基线；修改重置日、重置时刻后当前周期的累计会从 0 重新开始，需要的话可以在服务端用「手动校准」补回。
 - **Ping 与丢包**：对四个目标各做 3 次 TCP 连接探测（单次超时 2 秒，间隔 0.3 秒），目标没写端口时用 80。域名只解析一次（优先 IPv4，解析超时 3 秒），耗时只计算 TCP 握手。目标主动拒绝连接（RST）说明网络是通的，计为成功。延迟取成功次数的平均值（毫秒，最小 0.1），丢包率为失败次数的比例。结果的约定：数字表示有效值；`null` 表示这一轮全部失败；`false` 表示这个目标没有配置。
 - **IP 可用性**：用 UDP「连接」检查本机是否有到公网的 IPv4、IPv6 路由（不会真的发送数据包），结果为 `1` 或 `0`。
 - **连接数**：TCP 只统计 ESTABLISHED 状态的连接；UDP 统计套接字数量。
