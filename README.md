@@ -174,7 +174,7 @@ Agent 本地只有三项必需配置：上报地址、节点 ID、上报密钥�
 ### 5.2 HTTP 上报
 
 - 每个上报间隔向上报地址发一次 `POST`，请求体是 JSON：`id`、`secret`、`metrics`（完整指标）。
-- 请求头 `X-Agent-Version: lite-go-<版本号>`；`X-Agent-Config-Schema: 7` 和 `X-Agent-Config-Md5`（Agent 当前使用的配置的 MD5，首次为 `none`）。
+- 请求头 `X-Agent-Version: Lite-agent-<版本号>`（管理页节点卡片上显示的 Agent 版本就是它）；`X-Agent-Config-Schema: 7` 和 `X-Agent-Config-Md5`（Agent 当前使用的配置的 MD5，首次为 `none`）。
 - Worker 的响应：`204` 表示配置没有变化；`200` 且带配置串，表示有新配置，Agent 校验通过后应用，下一次上报带上新的 MD5。
 - 不跟随重定向，避免上报内容和密钥被带到别的地址。
 - 每一轮采集做 1 秒的 CPU 与网速采样，大约耗时 1 秒。Ping 由后台独立持续采样，上报时只取最新的统计值，不阻塞 HTTP 上报，也不阻塞实时推送；刚启动时第一次上报最多多等 15 秒，让每个目标至少有一个样本。
