@@ -124,7 +124,7 @@ func TestParseConfig(t *testing.T) {
 		"custom_ct=bad host",
 		"interface=eth0;rm",
 		"",
-		strings.Repeat("a=b&", 200),
+		strings.Repeat("a=b&", 300),
 	} {
 		if _, err := parseConfig(bad, cur); err == nil {
 			t.Fatalf("expected error for %q", bad)
@@ -154,32 +154,33 @@ func TestPeriodKey(t *testing.T) {
 		{time.Date(2026, 10, 31, 12, 0, 0, 0, utc), 0, "none"},
 	}
 	for _, c := range cases {
-		if got := periodKey(c.now, c.resetDay); got != c.want {
+		if got := periodKey(c.now, resetRule{Day: c.resetDay}); got != c.want {
 			t.Errorf("periodKey(%v, %d) = %s, want %s", c.now, c.resetDay, got, c.want)
 		}
 	}
 }
 
 func TestStateAdvance(t *testing.T) {
+	day1 := resetRule{Day: 1}
 	s := &state{}
 	t0 := time.Date(2026, 10, 10, 12, 0, 0, 0, time.UTC)
-	s.advance(1000, 2000, t0, 1, "")
+	s.advance(1000, 2000, t0, day1, "")
 	if s.RX != 0 || s.TX != 0 {
 		t.Fatalf("first sample only sets the baseline: %+v", s)
 	}
-	s.advance(1500, 2600, t0.Add(time.Minute), 1, "")
+	s.advance(1500, 2600, t0.Add(time.Minute), day1, "")
 	if s.RX != 500 || s.TX != 600 {
 		t.Fatalf("after delta: %+v", s)
 	}
-	s.advance(100, 50, t0.Add(2*time.Minute), 1, "") // 计数器被重置
+	s.advance(100, 50, t0.Add(2*time.Minute), day1, "") // 计数器被重置
 	if s.RX != 600 || s.TX != 650 {
 		t.Fatalf("after reset: %+v", s)
 	}
-	s.advance(200, 80, time.Date(2026, 11, 1, 0, 5, 0, 0, time.UTC), 1, "") // 新周期，累计清零后再加增量
+	s.advance(200, 80, time.Date(2026, 11, 1, 0, 5, 0, 0, time.UTC), day1, "") // 新周期，累计清零后再加增量
 	if s.Period != "2026-11-01" || s.RX != 100 || s.TX != 30 {
 		t.Fatalf("new period: %+v", s)
 	}
-	s.advance(999999, 999999, time.Date(2026, 11, 1, 0, 6, 0, 0, time.UTC), 1, "eth0") // 网卡配置变化：重建基线，不产生巨大增量
+	s.advance(999999, 999999, time.Date(2026, 11, 1, 0, 6, 0, 0, time.UTC), day1, "eth0") // 网卡配置变化：重建基线，不产生巨大增量
 	if s.RX != 100 || s.TX != 30 {
 		t.Fatalf("iface change must not add traffic: %+v", s)
 	}
@@ -298,7 +299,7 @@ func TestReporterSend(t *testing.T) {
 	if err != nil || res.Status != http.StatusNoContent {
 		t.Fatalf("res=%+v err=%v", res, err)
 	}
-	if gotHeader.Get("X-Agent-Config-Schema") != "6" || gotHeader.Get("X-Agent-Config-Md5") != "none" {
+	if gotHeader.Get("X-Agent-Config-Schema") != "7" || gotHeader.Get("X-Agent-Config-Md5") != "none" {
 		t.Fatalf("headers: %v", gotHeader)
 	}
 	if !strings.HasPrefix(gotHeader.Get("X-Agent-Version"), "lite-go-") {
@@ -391,5 +392,111 @@ func TestSumDisks(t *testing.T) {
 	// 其余挂载点没有数据（stat 失败）会被跳过：总量 = 100GB + 200GB + 512MB
 	if total != 300*1024+512 || used != 90*1024+10 {
 		t.Fatalf("total=%d used=%d", total, used)
+	}
+}
+
+func TestPeriodKeyResetTime(t *testing.T) {
+	sh, err := time.LoadLocation("Asia/Shanghai")
+	if err != nil {
+		t.Fatal(err)
+	}
+	at := func(y int, mo time.Month, d, h, mi int) time.Time { return time.Date(y, mo, d, h, mi, 0, 0, sh) }
+	cases := []struct {
+		now  time.Time
+		rule resetRule
+		want string
+	}{
+		{at(2026, 11, 1, 0, 0), resetRule{1, 0, 0, sh}, "2026-11-01"},
+		{at(2026, 11, 1, 8, 29), resetRule{1, 8, 30, sh}, "2026-10-01T08:30"}, // 还没到 8:30
+		{at(2026, 11, 1, 8, 30), resetRule{1, 8, 30, sh}, "2026-11-01T08:30"}, // 刚好到点
+		{at(2026, 11, 15, 23, 59), resetRule{15, 23, 59, sh}, "2026-11-15T23:59"},
+		{at(2026, 3, 31, 5, 0), resetRule{31, 6, 0, sh}, "2026-02-28T06:00"}, // 3 月 31 日 6 点前仍属 2 月周期
+		{at(2026, 1, 1, 1, 0), resetRule{1, 2, 0, sh}, "2025-12-01T02:00"},   // 跨年
+		{at(2026, 11, 1, 8, 30), resetRule{0, 8, 30, sh}, "none"},
+		// 传入的时间用别的时区表示，结果仍按规则里的时区算：UTC 10 月 31 日 16:00 就是上海 11 月 1 日 0:00
+		{time.Date(2026, 10, 31, 16, 0, 0, 0, time.UTC), resetRule{1, 0, 0, sh}, "2026-11-01"},
+		{time.Date(2026, 10, 31, 15, 59, 0, 0, time.UTC), resetRule{1, 0, 0, sh}, "2026-10-01"},
+	}
+	for _, c := range cases {
+		if got := periodKey(c.now, c.rule); got != c.want {
+			t.Errorf("periodKey(%v, %+v) = %s, want %s", c.now, c.rule, got, c.want)
+		}
+	}
+}
+
+func TestParseConfigResetAndCalibration(t *testing.T) {
+	cur := defaultConfig()
+	if cur.TZName != "Asia/Shanghai" || cur.Loc == nil || cur.ResetHour != 0 || cur.ResetMinute != 0 {
+		t.Fatalf("defaults: %+v", cur)
+	}
+	body := "report_interval=60&reset_day=5&reset_hour=8&reset_minute=5&timezone=America/New_York&cal_id=1760000000&cal_rx=1073741824&cal_tx=2147483648&cal_period=2026-11-05T08:05"
+	next, err := parseConfig(body, cur)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next.ResetDay != 5 || next.ResetHour != 8 || next.ResetMinute != 5 || next.TZName != "America/New_York" || next.Loc.String() != "America/New_York" {
+		t.Fatalf("unexpected: %+v", next)
+	}
+	if next.CalID != "1760000000" || next.CalRX != 1<<30 || next.CalTX != 2<<30 || next.CalPeriod != "2026-11-05T08:05" {
+		t.Fatalf("calibration: %+v", next)
+	}
+	// 没有 cal_id：待应用的校准被清掉
+	again, err := parseConfig("report_interval=60&reset_day=5", next)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.CalID != "" || again.CalRX != 0 || again.CalTX != 0 || again.CalPeriod != "" {
+		t.Fatalf("calibration should be cleared: %+v", again)
+	}
+	if again.TZName != "America/New_York" || again.ResetHour != 8 {
+		t.Fatalf("other fields must be kept: %+v", again)
+	}
+	for _, bad := range []string{
+		"report_interval=60&reset_hour=24",
+		"report_interval=60&reset_minute=60",
+		"report_interval=60&reset_hour=x",
+		"report_interval=60&timezone=Mars/Base",
+		"report_interval=60&timezone=+08:00",
+		"report_interval=60&cal_id=1&cal_rx=1",                                   // 缺 cal_tx 和 cal_period
+		"report_interval=60&cal_id=1&cal_rx=-1&cal_tx=1&cal_period=none",         // 负数
+		"report_interval=60&cal_id=1&cal_rx=1&cal_tx=1&cal_period=bad",           // 周期格式不对
+		"report_interval=60&cal_id=abc&cal_rx=1&cal_tx=1&cal_period=2026-11-01", // 编号不是数字
+	} {
+		if _, err := parseConfig(bad, cur); err == nil {
+			t.Fatalf("expected error for %q", bad)
+		}
+	}
+}
+
+func TestStateCalibrate(t *testing.T) {
+	rule := resetRule{Day: 1}
+	s := &state{}
+	t0 := time.Date(2026, 11, 10, 12, 0, 0, 0, time.UTC)
+	s.advance(1000, 1000, t0, rule, "")
+	s.advance(1500, 1700, t0.Add(time.Minute), rule, "")
+	cfg := defaultConfig()
+	cfg.CalID, cfg.CalRX, cfg.CalTX, cfg.CalPeriod = "100", 5000, 9000, "2026-11-01"
+	s.calibrate(cfg)
+	if s.RX != 5000 || s.TX != 9000 || s.CalID != "100" {
+		t.Fatalf("calibration not applied: %+v", s)
+	}
+	s.advance(1600, 1800, t0.Add(2*time.Minute), rule, "") // 校准之后继续累计
+	if s.RX != 5100 || s.TX != 9100 {
+		t.Fatalf("must keep accumulating from the calibrated value: %+v", s)
+	}
+	s.calibrate(cfg) // 同一个编号只应用一次
+	if s.RX != 5100 || s.TX != 9100 {
+		t.Fatalf("same cal_id must not be applied twice: %+v", s)
+	}
+	cfg.CalID, cfg.CalPeriod = "101", "2026-10-01" // 不是当前周期的校准：忽略
+	s.calibrate(cfg)
+	if s.RX != 5100 || s.CalID != "100" {
+		t.Fatalf("stale-period calibration must be ignored: %+v", s)
+	}
+	cfg.CalPeriod = "2026-11-01"
+	cfg.CalRX, cfg.CalTX = 0, 0 // 新的编号：可以再次校准，填 0 也有效
+	s.calibrate(cfg)
+	if s.RX != 0 || s.TX != 0 || s.CalID != "101" {
+		t.Fatalf("recalibration failed: %+v", s)
 	}
 }

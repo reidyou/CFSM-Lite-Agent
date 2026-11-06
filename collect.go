@@ -155,7 +155,8 @@ func readHeavy() map[string]any {
 // 组成一份完整的指标。Worker 和推送中心都按「完整指标」处理，所以实时帧也必须带上所有字段。
 func buildMetrics(a, b snapshot, cfg config, st *state, heavy, ping map[string]any) map[string]any {
 	secs := b.at.Sub(a.at).Seconds()
-	st.advance(b.rx, b.tx, b.at, cfg.ResetDay, cfg.Interface)
+	st.advance(b.rx, b.tx, b.at, cfg.rule(), cfg.Interface)
+	st.calibrate(cfg)
 	rxMonthly, txMonthly := st.monthly()
 	mem := parseMeminfo(readFileString("/proc/meminfo"))
 	m := map[string]any{

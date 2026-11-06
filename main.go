@@ -15,6 +15,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	_ "time/tzdata" // 内嵌时区数据库：流量重置时刻按服务端设置的时区计算，不依赖服务器自带的 tzdata
 )
 
 // version 在构建时用 -ldflags "-X main.version=v0.1.0" 注入。
@@ -132,7 +133,7 @@ func run(ctx context.Context, s settings) {
 					cfg = next
 					box.set(cfg)
 					cfgMD5 = md5Hex(res.Body) // Worker 对完整响应体计算 MD5，这里原样回传
-					log.Printf("已应用新配置：上报间隔 %s，重置日 %d，连接模式 %s", cfg.ReportInterval, cfg.ResetDay, cfg.ConnMode)
+					log.Printf("已应用新配置：上报间隔 %s，重置 每月%d日 %02d:%02d（%s），连接模式 %s", cfg.ReportInterval, cfg.ResetDay, cfg.ResetHour, cfg.ResetMinute, cfg.TZName, cfg.ConnMode)
 					wait = cfg.ReportInterval
 				}
 			}
