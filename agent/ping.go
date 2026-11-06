@@ -4,17 +4,34 @@ import (
 	"context"
 	"errors"
 	"net"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 )
 
+// 延迟与丢包的采集和计算方式参照 komari-agent：每个样本只探测一次（TCP 握手，超时 3 秒），
+// 失败记为丢包；握手耗时超过 1 秒时重测，疑似 SYN 重传的样本也记为丢包（见 measureSample）。
+// 丢包率不是在一次探测里算，而是在一段时间的大量样本上统计：komari 由面板统计，
+// Lite 的服务端只保存最新值，所以样本留在 Agent 里，按滑动窗口统计后随指标上报。
 const (
-	pingProbes  = 3                      // 每个目标每轮探测次数
-	pingTimeout = 2 * time.Second        // 单次连接超时
-	pingGap     = 300 * time.Millisecond // 两次探测的间隔
+	pingTimeout       = 3 * time.Second  // 单次连接超时
+	pingInterval      = 10 * time.Second // 每个目标的采样间隔
+	pingLossWindow    = 10 * time.Minute // 丢包率统计窗口
+	pingLatencyWindow = time.Minute      // 延迟（取中位数）统计窗口
+	pingMaxSamples    = 360              // 每个目标最多保留的样本数
+	pingFirstWait     = 15 * time.Second // 第一次上报前最多等多久，让每个目标至少有一个样本
+
+	pingHighMs    = 1000 // 耗时超过这个值（毫秒）就重测
+	pingRetries   = 3    // 重测次数上限
+	pingRetryDrop = 800  // 重测耗时比首次少这么多（毫秒）以上，认为首次遇到了 SYN 重传：首次 1000ms 的重传超时减去 200ms 抖动
+)
+
+var (
+	errResolve    = errors.New("failed to resolve target")
+	errRetransmit = errors.New("suspicious retransmission detected in tcp handshake")
+	errStillHigh  = errors.New("latency remains high after retries")
 )
 
 func sleepCtx(ctx context.Context, d time.Duration) bool {
@@ -66,76 +83,246 @@ func resolveHost(ctx context.Context, host string) (string, bool) {
 	return addrs[0].IP.String(), true
 }
 
-// probeTarget 对目标做 pingProbes 次 TCP 连接探测，返回平均耗时（毫秒）和成功次数。
-// 域名先解析一次，耗时只计算 TCP 握手。对方主动拒绝连接（RST）说明网络是通的，也计为成功。
-func probeTarget(ctx context.Context, host, port string) (avgMs float64, ok int) {
-	ip, found := resolveHost(ctx, host)
-	if !found {
-		return 0, 0
+// tcpPing 测一次 TCP 握手耗时。域名先解析，耗时只计算握手；连接失败（包括被拒绝）都返回错误，与 komari 一致。
+func tcpPing(ctx context.Context, host, port string) (time.Duration, error) {
+	ip, ok := resolveHost(ctx, host)
+	if !ok {
+		return 0, errResolve
 	}
-	addr := net.JoinHostPort(ip, port)
-	var sum time.Duration
-	for i := 0; i < pingProbes; i++ {
-		d := net.Dialer{Timeout: pingTimeout}
-		t0 := time.Now()
-		c, err := d.DialContext(ctx, "tcp", addr)
-		elapsed := time.Since(t0)
-		if err == nil {
-			_ = c.Close()
-			sum += elapsed
-			ok++
-		} else if errors.Is(err, syscall.ECONNREFUSED) {
-			sum += elapsed
-			ok++
-		}
-		if i < pingProbes-1 && !sleepCtx(ctx, pingGap) {
-			break
-		}
+	d := net.Dialer{Timeout: pingTimeout}
+	t0 := time.Now()
+	c, err := d.DialContext(ctx, "tcp", net.JoinHostPort(ip, port))
+	elapsed := time.Since(t0)
+	if err != nil {
+		return 0, err
 	}
-	if ok == 0 {
-		return 0, 0
-	}
-	v := round1(float64(sum) / float64(ok) / float64(time.Millisecond))
-	if v < 0.1 {
-		v = 0.1
-	}
-	return v, ok
+	_ = c.Close()
+	return elapsed, nil
 }
 
-// startPing 并行探测四个目标，结果通过 channel 返回，可以与系统指标采集同时进行。
-// 结果的约定与 Worker 一致：ping_* 为数字（毫秒）、null（本轮全部超时）、false（未配置）；loss_* 为丢包百分比。
-func startPing(ctx context.Context, cfg config) <-chan map[string]any {
-	ch := make(chan map[string]any, 1)
-	go func() {
-		out := map[string]any{}
-		var mu sync.Mutex
-		var wg sync.WaitGroup
-		for _, k := range slotKeys {
-			host, port, ok := normalizeTarget(cfg.Targets[k])
-			if !ok {
-				mu.Lock()
-				out["ping_"+k] = false
-				out["loss_"+k] = false
-				mu.Unlock()
-				continue
-			}
-			wg.Add(1)
-			go func(k, host, port string) {
-				defer wg.Done()
-				avg, okN := probeTarget(ctx, host, port)
-				loss := round1(float64(pingProbes-okN) * 100 / float64(pingProbes))
-				mu.Lock()
-				defer mu.Unlock()
-				if okN == 0 {
-					out["ping_"+k] = nil
-				} else {
-					out["ping_"+k] = avg
-				}
-				out["loss_"+k] = loss
-			}(k, host, port)
+// measureSample 得到一个样本，处理方式与 komari-agent 的 NewPingTask 相同：
+// 首次测量失败，样本记为丢包；耗时不超过 1000ms，直接采用；
+// 超过 1000ms 就重测，最多 3 次：重测失败记为丢包；重测不超过 1000ms 时，
+// 如果比首次少了 800ms 以上，说明首次多半是 SYN 丢失后等内核 1 秒重传，不是真实延迟，记为丢包，否则采用重测值；
+// 3 次重测都还是超过 1000ms，记为丢包。
+func measureSample(measure func() (time.Duration, error)) (time.Duration, error) {
+	first, err := measure()
+	if err != nil {
+		return 0, err
+	}
+	if first.Milliseconds() <= pingHighMs {
+		return first, nil
+	}
+	for i := 0; i < pingRetries; i++ {
+		second, err2 := measure()
+		if err2 != nil {
+			return 0, err2
 		}
-		wg.Wait()
-		ch <- out
-	}()
-	return ch
+		if second.Milliseconds() <= pingHighMs {
+			if first.Milliseconds()-second.Milliseconds() > pingRetryDrop {
+				return 0, errRetransmit
+			}
+			return second, nil
+		}
+	}
+	return 0, errStillHigh
+}
+
+// pingSample 是一次采样的结果。
+type pingSample struct {
+	at time.Time
+	ms float64 // 握手耗时（毫秒），失败时为 0
+	ok bool
+}
+
+type slotHist struct {
+	target  string
+	samples []pingSample
+}
+
+// pinger 在后台对四个目标持续采样，把滑动窗口内的统计结果发布到 sharedData，
+// HTTP 上报和实时推送都读取同一份结果。
+type pinger struct {
+	mu      sync.Mutex
+	targets map[string]string    // 槽位 -> 当前探测目标（host:port）；空表示未配置
+	hist    map[string]*slotHist // 槽位 -> 样本
+	sh      *sharedData
+	now     func() time.Time
+}
+
+func newPinger(sh *sharedData) *pinger {
+	return &pinger{targets: map[string]string{}, hist: map[string]*slotHist{}, sh: sh, now: time.Now}
+}
+
+// setTarget 记录槽位当前的目标；目标变了（或被清空）就丢掉旧样本，避免新旧目标的数据混在一起统计。
+func (p *pinger) setTarget(slot, target string) {
+	p.mu.Lock()
+	if old, seen := p.targets[slot]; seen && old == target {
+		p.mu.Unlock()
+		return
+	}
+	p.targets[slot] = target
+	delete(p.hist, slot)
+	out := p.buildLocked()
+	p.mu.Unlock()
+	p.sh.setPing(out)
+}
+
+// record 保存一个样本，并发布最新的统计结果。目标已经变了的过期样本直接丢弃。
+func (p *pinger) record(slot, target string, at time.Time, d time.Duration, ok bool) {
+	p.mu.Lock()
+	if p.targets[slot] != target {
+		p.mu.Unlock()
+		return
+	}
+	h := p.hist[slot]
+	if h == nil {
+		h = &slotHist{target: target}
+		p.hist[slot] = h
+	}
+	s := pingSample{at: at, ok: ok}
+	if ok {
+		s.ms = round1(float64(d) / float64(time.Millisecond))
+		if s.ms < 0.1 {
+			s.ms = 0.1
+		}
+	}
+	h.samples = append(h.samples, s)
+	cut := at.Add(-pingLossWindow)
+	drop := 0
+	for drop < len(h.samples) && h.samples[drop].at.Before(cut) {
+		drop++
+	}
+	if over := len(h.samples) - drop - pingMaxSamples; over > 0 {
+		drop += over
+	}
+	h.samples = append([]pingSample(nil), h.samples[drop:]...)
+	out := p.buildLocked()
+	p.mu.Unlock()
+	p.sh.setPing(out)
+}
+
+// buildLocked 生成要上报的 ping_* 和 loss_*（调用时必须持有 p.mu）。结果的约定与 Worker 一致：
+// ping_* 为数字（毫秒）、null（窗口内全部失败）、false（未配置）；loss_* 为丢包百分比。
+// 已配置但还没有样本的槽位不放进结果，由 pingReady 判断是否还在等第一个样本。
+func (p *pinger) buildLocked() map[string]any {
+	now := p.now()
+	out := map[string]any{}
+	for _, k := range slotKeys {
+		if p.targets[k] == "" {
+			out["ping_"+k] = false
+			out["loss_"+k] = false
+			continue
+		}
+		h := p.hist[k]
+		if h == nil {
+			continue
+		}
+		if lat, loss, ok := summarize(h.samples, now); ok {
+			out["ping_"+k] = lat
+			out["loss_"+k] = loss
+		}
+	}
+	return out
+}
+
+// summarize 统计一个目标的样本：丢包率 = 丢包窗口内失败数 ÷ 总数；
+// 延迟 = 延迟窗口内成功样本的中位数，窗口内没有成功样本时为 nil（超时）。
+// 丢包窗口内没有任何样本时 ok 为 false。
+func summarize(samples []pingSample, now time.Time) (latency any, loss float64, ok bool) {
+	lossCut := now.Add(-pingLossWindow)
+	latCut := now.Add(-pingLatencyWindow)
+	total, failed := 0, 0
+	var recent []float64
+	for _, s := range samples {
+		if s.at.Before(lossCut) {
+			continue
+		}
+		total++
+		if !s.ok {
+			failed++
+		} else if !s.at.Before(latCut) {
+			recent = append(recent, s.ms)
+		}
+	}
+	if total == 0 {
+		return nil, 0, false
+	}
+	loss = round1(float64(failed) * 100 / float64(total))
+	if len(recent) == 0 {
+		return nil, loss, true
+	}
+	sort.Float64s(recent)
+	n := len(recent)
+	med := recent[n/2]
+	if n%2 == 0 {
+		med = (recent[n/2-1] + recent[n/2]) / 2
+	}
+	return round1(med), loss, true
+}
+
+// run 为四个槽位各起一个协程，持续采样直到 ctx 结束。
+func (p *pinger) run(ctx context.Context, box *cfgBox) {
+	var wg sync.WaitGroup
+	for _, k := range slotKeys {
+		wg.Add(1)
+		go func(k string) {
+			defer wg.Done()
+			p.runSlot(ctx, k, box)
+		}(k)
+	}
+	wg.Wait()
+}
+
+func (p *pinger) runSlot(ctx context.Context, slot string, box *cfgBox) {
+	for {
+		started := time.Now()
+		host, port, ok := normalizeTarget(box.get().Targets[slot])
+		if !ok {
+			p.setTarget(slot, "")
+		} else {
+			target := net.JoinHostPort(host, port)
+			p.setTarget(slot, target)
+			d, err := measureSample(func() (time.Duration, error) { return tcpPing(ctx, host, port) })
+			if ctx.Err() != nil {
+				return
+			}
+			p.record(slot, target, started, d, err == nil)
+		}
+		wait := pingInterval - time.Since(started)
+		if wait < time.Second {
+			wait = time.Second
+		}
+		if !sleepCtx(ctx, wait) {
+			return
+		}
+	}
+}
+
+// pingReady 判断每个已配置的目标是否都已经有了统计结果。
+func pingReady(m map[string]any, cfg config) bool {
+	for _, k := range slotKeys {
+		if _, _, ok := normalizeTarget(cfg.Targets[k]); !ok {
+			continue
+		}
+		if _, has := m["ping_"+k]; !has {
+			return false
+		}
+	}
+	return true
+}
+
+// waitPing 等到每个已配置的目标至少有一个样本（最多等 max），返回当前的统计结果；
+// 只在刚启动的第一轮上报时才会真的等待。
+func waitPing(ctx context.Context, sh *sharedData, cfg config, max time.Duration) map[string]any {
+	deadline := time.Now().Add(max)
+	for {
+		m := sh.getPing()
+		if pingReady(m, cfg) || !time.Now().Before(deadline) {
+			return m
+		}
+		if !sleepCtx(ctx, 100*time.Millisecond) {
+			return sh.getPing()
+		}
+	}
 }

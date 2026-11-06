@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -222,7 +223,7 @@ func TestNormalizeTarget(t *testing.T) {
 	}
 }
 
-func TestProbeTarget(t *testing.T) {
+func TestTCPPing(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Skip("cannot listen:", err)
@@ -237,26 +238,175 @@ func TestProbeTarget(t *testing.T) {
 		}
 	}()
 	_, port, _ := net.SplitHostPort(ln.Addr().String())
-	avg, ok := probeTarget(context.Background(), "127.0.0.1", port)
-	if ok != pingProbes || avg <= 0 {
-		t.Fatalf("listening port: avg=%v ok=%d", avg, ok)
+	d, err := tcpPing(context.Background(), "127.0.0.1", port)
+	if err != nil || d <= 0 {
+		t.Fatalf("listening port: d=%v err=%v", d, err)
 	}
 	_ = ln.Close()
-	// 端口已关闭：连接被拒绝也说明网络是通的，按成功计
-	if _, ok := probeTarget(context.Background(), "127.0.0.1", port); ok != pingProbes {
-		t.Fatalf("refused connection should count as reachable, ok=%d", ok)
+	// 端口已关闭：与 komari 一致，连接被拒绝记为失败
+	if _, err := tcpPing(context.Background(), "127.0.0.1", port); err == nil {
+		t.Fatal("refused connection must be a failed sample")
 	}
 }
 
-func TestStartPingShape(t *testing.T) {
-	cfg := defaultConfig()
-	cfg.Targets = map[string]string{"ct": "127.0.0.1:1", "cu": "", "cm": "", "bd": ""}
-	out := <-startPing(context.Background(), cfg)
-	if out["ping_cu"] != false || out["loss_cu"] != false {
-		t.Fatalf("unconfigured slot must be false: %+v", out)
+// 逐次返回预设结果的 measure，用来验证 measureSample 与 komari 的处理一致。
+func scripted(steps ...any) (func() (time.Duration, error), *int) {
+	n := 0
+	return func() (time.Duration, error) {
+		if n >= len(steps) {
+			panic("measure called more often than scripted")
+		}
+		s := steps[n]
+		n++
+		if err, ok := s.(error); ok {
+			return 0, err
+		}
+		return s.(time.Duration), nil
+	}, &n
+}
+
+func TestMeasureSample(t *testing.T) {
+	ms := func(n int) time.Duration { return time.Duration(n) * time.Millisecond }
+	boom := errors.New("boom")
+	cases := []struct {
+		name  string
+		steps []any
+		want  time.Duration
+		err   error
+		calls int
+	}{
+		{"正常：只测一次", []any{ms(180)}, ms(180), nil, 1},
+		{"刚好 1000ms 不重测", []any{ms(1000)}, ms(1000), nil, 1},
+		{"首次失败：不重测，记丢包", []any{boom}, 0, boom, 1},
+		{"SYN 重传：首次 1200，重测 200，差 1000 > 800 -> 丢包", []any{ms(1200), ms(200)}, 0, errRetransmit, 2},
+		{"确实偏高：首次 1100，重测 900，差 200 -> 采用重测值", []any{ms(1100), ms(900)}, ms(900), nil, 2},
+		{"差值刚好 800 不算重传", []any{ms(1500), ms(700)}, ms(700), nil, 2},
+		{"重测失败 -> 丢包", []any{ms(1500), boom}, 0, boom, 2},
+		{"三次重测都偏高 -> 丢包", []any{ms(1500), ms(1400), ms(1300), ms(1200)}, 0, errStillHigh, 4},
 	}
-	if _, ok := out["loss_ct"].(float64); !ok {
-		t.Fatalf("loss_ct must be a number: %+v", out)
+	for _, c := range cases {
+		m, n := scripted(c.steps...)
+		got, err := measureSample(m)
+		if err != c.err || got != c.want || *n != c.calls {
+			t.Errorf("%s: got (%v, %v) after %d calls, want (%v, %v) after %d calls", c.name, got, err, *n, c.want, c.err, c.calls)
+		}
+	}
+	// 前两次重测仍偏高、第三次才回落到 1000ms 以内：只比首次少 600ms，不算重传，采用回落后的值
+	m, n := scripted(ms(1500), ms(1400), ms(1300), ms(900))
+	if got, err := measureSample(m); err != nil || got != ms(900) || *n != 4 {
+		t.Errorf("third retry: got (%v, %v) after %d calls", got, err, *n)
+	}
+}
+
+func TestSummarize(t *testing.T) {
+	now := time.Date(2026, 11, 8, 12, 0, 0, 0, time.UTC)
+	at := func(secAgo int) time.Time { return now.Add(-time.Duration(secAgo) * time.Second) }
+	ok := func(secAgo int, ms float64) pingSample { return pingSample{at: at(secAgo), ms: ms, ok: true} }
+	bad := func(secAgo int) pingSample { return pingSample{at: at(secAgo)} }
+
+	if _, _, has := summarize(nil, now); has {
+		t.Fatal("no samples must report ok=false")
+	}
+	// 10 个样本里 2 个失败：丢包 20%；最近 1 分钟内的成功样本取中位数
+	samples := []pingSample{ok(500, 900), bad(400), ok(300, 800), ok(200, 700), bad(100), ok(50, 210), ok(40, 190), ok(30, 200), ok(20, 205), ok(10, 195)}
+	lat, loss, has := summarize(samples, now)
+	if !has || loss != 20 || lat != 200.0 {
+		t.Fatalf("lat=%v loss=%v ok=%v", lat, loss, has)
+	}
+	// 偶数个成功样本：取中间两个的平均
+	lat, _, _ = summarize([]pingSample{ok(30, 100), ok(20, 200)}, now)
+	if lat != 150.0 {
+		t.Fatalf("even median = %v", lat)
+	}
+	// 最近 1 分钟全部失败：延迟为 nil（超时），丢包率仍按 10 分钟窗口算
+	lat, loss, _ = summarize([]pingSample{ok(300, 100), ok(200, 100), bad(30), bad(20), bad(10), bad(5)}, now)
+	if lat != nil || loss != round1(400.0/6) {
+		t.Fatalf("lat=%v loss=%v", lat, loss)
+	}
+	// 窗口外的样本不计入
+	lat, loss, has = summarize([]pingSample{bad(700), ok(10, 50)}, now)
+	if !has || loss != 0 || lat != 50.0 {
+		t.Fatalf("old samples counted: lat=%v loss=%v", lat, loss)
+	}
+	if _, _, has := summarize([]pingSample{bad(700)}, now); has {
+		t.Fatal("only samples outside the window must report ok=false")
+	}
+}
+
+func TestPingerPublish(t *testing.T) {
+	sh := &sharedData{}
+	p := newPinger(sh)
+	now := time.Date(2026, 11, 8, 12, 0, 0, 0, time.UTC)
+	p.now = func() time.Time { return now }
+	cfg := defaultConfig()
+	cfg.Targets = map[string]string{"ct": "a.example:80", "cu": "", "cm": "", "bd": ""}
+
+	// 还没有任何样本：未配置的槽位是 false，已配置的槽位暂时没有结果
+	for _, k := range slotKeys {
+		if k == "ct" {
+			p.setTarget(k, "a.example:80")
+		} else {
+			p.setTarget(k, "")
+		}
+	}
+	m := sh.getPing()
+	if m["ping_cu"] != false || m["loss_cu"] != false {
+		t.Fatalf("unconfigured slot must be false: %+v", m)
+	}
+	if _, has := m["ping_ct"]; has || pingReady(m, cfg) {
+		t.Fatalf("configured slot without samples must be missing and not ready: %+v", m)
+	}
+	// 目标不对的样本会被丢弃
+	p.record("ct", "other:80", now, 10*time.Millisecond, true)
+	if _, has := sh.getPing()["ping_ct"]; has {
+		t.Fatal("sample for a stale target must be dropped")
+	}
+	// 收集样本：一次失败、三次成功
+	p.record("ct", "a.example:80", now.Add(-30*time.Second), 0, false)
+	p.record("ct", "a.example:80", now.Add(-20*time.Second), 200*time.Millisecond, true)
+	p.record("ct", "a.example:80", now.Add(-10*time.Second), 210*time.Millisecond, true)
+	p.record("ct", "a.example:80", now, 190*time.Millisecond, true)
+	m = sh.getPing()
+	if m["ping_ct"] != 200.0 || m["loss_ct"] != 25.0 || !pingReady(m, cfg) {
+		t.Fatalf("unexpected: %+v", m)
+	}
+	// 目标改了：旧样本清掉，要重新等第一个样本
+	p.setTarget("ct", "b.example:443")
+	m = sh.getPing()
+	if _, has := m["ping_ct"]; has {
+		t.Fatalf("old samples must be cleared when the target changes: %+v", m)
+	}
+	// 目标被清空：变成未配置
+	p.setTarget("ct", "")
+	if m = sh.getPing(); m["ping_ct"] != false {
+		t.Fatalf("cleared slot must be false: %+v", m)
+	}
+	// 窗口内全部失败：延迟为 nil，丢包 100
+	p.setTarget("ct", "a.example:80")
+	p.record("ct", "a.example:80", now, 0, false)
+	m = sh.getPing()
+	if v, has := m["ping_ct"]; !has || v != nil || m["loss_ct"] != 100.0 {
+		t.Fatalf("all failed: %+v", m)
+	}
+}
+
+func TestPingerKeepsBoundedSamples(t *testing.T) {
+	p := newPinger(&sharedData{})
+	now := time.Date(2026, 11, 8, 12, 0, 0, 0, time.UTC)
+	p.now = func() time.Time { return now }
+	p.setTarget("ct", "a.example:80")
+	for i := 0; i < pingMaxSamples+50; i++ {
+		p.record("ct", "a.example:80", now, time.Millisecond, true)
+	}
+	if n := len(p.hist["ct"].samples); n != pingMaxSamples {
+		t.Fatalf("samples = %d, want %d", n, pingMaxSamples)
+	}
+	// 超过丢包窗口的样本会被清掉
+	later := now.Add(pingLossWindow + time.Minute)
+	p.now = func() time.Time { return later }
+	p.record("ct", "a.example:80", later, time.Millisecond, true)
+	if n := len(p.hist["ct"].samples); n != 1 {
+		t.Fatalf("samples after window = %d, want 1", n)
 	}
 }
 

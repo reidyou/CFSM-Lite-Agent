@@ -115,7 +115,7 @@ func diskTotals() (totalMB, usedMB int64) {
 	return totalMB, usedMB
 }
 
-// sharedData 在 HTTP 上报循环和实时推送协程之间共享最近一次的 Ping 结果。
+// sharedData 在后台 Ping 采样、HTTP 上报循环和实时推送协程之间共享最新的 Ping 统计结果。
 type sharedData struct {
 	mu   sync.Mutex
 	ping map[string]any
@@ -193,16 +193,15 @@ func buildMetrics(a, b snapshot, cfg config, st *state, heavy, ping map[string]a
 	return m
 }
 
-// collectMetrics 采集一轮指标（HTTP 上报用）：Ping 探测与 1 秒的 CPU、网速采样同时进行，一轮大约耗时 1 到 8 秒。
+// collectMetrics 采集一轮指标（HTTP 上报用）：用 1 秒的采样算 CPU 和网速，Ping 结果直接取后台采样的统计值；
+// 刚启动时后台还没有样本，最多等 pingFirstWait。
 func collectMetrics(ctx context.Context, cfg config, st *state, sh *sharedData) map[string]any {
-	pingCh := startPing(ctx, cfg)
 	only := splitIfaces(cfg.Interface)
 	a := readSnapshot(only)
 	sleepCtx(ctx, time.Second)
 	b := readSnapshot(only)
 	heavy := readHeavy()
-	ping := <-pingCh
-	sh.setPing(ping)
+	ping := waitPing(ctx, sh, cfg, pingFirstWait)
 	return buildMetrics(a, b, cfg, st, heavy, ping)
 }
 

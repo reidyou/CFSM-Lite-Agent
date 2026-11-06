@@ -107,6 +107,7 @@ func run(ctx context.Context, s settings) {
 	defer func() { _ = st.save(s.StatePath) }()
 	go saveLoop(ctx, st, s.StatePath, 30*time.Second)
 	sh := &sharedData{}
+	go newPinger(sh).run(ctx, box) // 后台持续采样延迟和丢包，上报时只取统计结果
 	rep := newReporter(s)
 	cfgMD5 := "none"
 	warnedICMP := false
