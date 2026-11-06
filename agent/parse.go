@@ -231,6 +231,50 @@ func osPrettyName(text string) string {
 	return ""
 }
 
+// osReleaseValue 取 /etc/os-release 里某个键的值（去掉引号）。
+func osReleaseValue(text, key string) string {
+	sc := bufio.NewScanner(strings.NewReader(text))
+	for sc.Scan() {
+		line := sc.Text()
+		if strings.HasPrefix(line, key+"=") {
+			return strings.Trim(strings.TrimPrefix(line, key+"="), `"'`)
+		}
+	}
+	return ""
+}
+
+// isDottedVersion 判断是不是 13、13.1 这样的纯数字版本号（testing、sid 的 debian_version 是 trixie/sid，不算）。
+func isDottedVersion(v string) bool {
+	if v == "" || v[0] < '0' || v[0] > '9' || v[len(v)-1] == '.' {
+		return false
+	}
+	for i := 0; i < len(v); i++ {
+		if c := v[i]; c != '.' && (c < '0' || c > '9') {
+			return false
+		}
+	}
+	return !strings.Contains(v, "..")
+}
+
+// osDisplayName 生成要显示的系统名称。Debian 的 PRETTY_NAME 只有大版本（Debian GNU/Linux 13 (trixie)），
+// 小版本在 /etc/debian_version 里，所以 Debian 显示为「Debian 13.1 (trixie)」；
+// 其他发行版、或 debian_version 不是数字版本号时，仍用 PRETTY_NAME。
+func osDisplayName(osRelease, debianVersion string) string {
+	pretty := osPrettyName(osRelease)
+	if osReleaseValue(osRelease, "ID") != "debian" {
+		return pretty
+	}
+	v := strings.TrimSpace(debianVersion)
+	if !isDottedVersion(v) {
+		return pretty
+	}
+	name := "Debian " + v
+	if cn := osReleaseValue(osRelease, "VERSION_CODENAME"); cn != "" {
+		name += " (" + cn + ")"
+	}
+	return name
+}
+
 func cpuModel(text string) string {
 	sc := bufio.NewScanner(strings.NewReader(text))
 	for sc.Scan() {

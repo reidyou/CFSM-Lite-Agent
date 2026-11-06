@@ -32,7 +32,7 @@ func readFileString(path string) string {
 // loadStatic 读取不会变化的主机信息，只读一次。
 func loadStatic() staticInfo {
 	staticOnce.Do(func() {
-		osName := osPrettyName(readFileString("/etc/os-release"))
+		osName := osDisplayName(readFileString("/etc/os-release"), readFileString("/etc/debian_version"))
 		if osName == "" {
 			osName = "Linux"
 		}

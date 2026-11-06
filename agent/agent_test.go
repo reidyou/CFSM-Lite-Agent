@@ -95,6 +95,20 @@ func TestOSAndCPU(t *testing.T) {
 	if got := osPrettyName("NAME=Ubuntu\nPRETTY_NAME=\"Ubuntu 22.04.4 LTS\"\n"); got != "Ubuntu 22.04.4 LTS" {
 		t.Fatalf("os = %q", got)
 	}
+	deb := "PRETTY_NAME=\"Debian GNU/Linux 13 (trixie)\"\nNAME=\"Debian GNU/Linux\"\nVERSION_ID=\"13\"\nVERSION_CODENAME=trixie\nID=debian\n"
+	for _, c := range []struct{ rel, ver, want string }{
+		{deb, "13.1\n", "Debian 13.1 (trixie)"},
+		{deb, "13.0", "Debian 13.0 (trixie)"},
+		// testing/sid：没有数字版本号，沿用 PRETTY_NAME
+		{deb, "trixie/sid\n", "Debian GNU/Linux 13 (trixie)"},
+		// 读不到 debian_version
+		{deb, "", "Debian GNU/Linux 13 (trixie)"},
+		{"PRETTY_NAME=\"Ubuntu 22.04.4 LTS\"\nID=ubuntu\n", "13.1", "Ubuntu 22.04.4 LTS"},
+	} {
+		if got := osDisplayName(c.rel, c.ver); got != c.want {
+			t.Fatalf("osDisplayName(%q, %q) = %q, want %q", c.rel, c.ver, got, c.want)
+		}
+	}
 	if got := cpuModel("processor : 0\nmodel name\t: Intel Xeon\n"); got != "Intel Xeon" {
 		t.Fatalf("cpu = %q", got)
 	}
