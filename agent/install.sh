@@ -1,8 +1,14 @@
 #!/bin/sh
-# CFSM Lite Agent 安装脚本。由 Worker 的 /install.sh 提供（已填入发布仓库），也可以直接保存后执行。
-# 用法：
-#   sh install.sh -i <节点ID> -s <上报密钥> -u <https://你的域名/update>
-#   sh install.sh --uninstall
+# CFSM Lite Agent 安装脚本。
+#
+# 用法一（推荐）：用 Worker 管理页「节点 → 安装命令」生成的命令。Worker 会把本脚本的发布仓库填好：
+#   curl -fsSL https://你的域名/install.sh | sh -s -- -i 节点ID -s 上报密钥 -u https://你的域名/update
+#
+# 用法二：直接从 Agent 仓库执行，用环境变量 CFSM_AGENT_REPO 指定发布仓库：
+#   curl -fsSL https://raw.githubusercontent.com/用户名/CFSM-Lite-Agent/main/install.sh | CFSM_AGENT_REPO=用户名/CFSM-Lite-Agent sh -s -- -i 节点ID -s 上报密钥 -u https://你的域名/update
+#
+# 卸载：在上面任意一条命令的 sh -s -- 后面改成 --uninstall
+# 指定版本：加参数 -v v1.0.0（默认安装最新的 Release）
 set -eu
 
 REPO="__REPO__"
@@ -40,6 +46,16 @@ if [ "$ACTION" = uninstall ]; then
   echo "已卸载 cfsm-lite-agent"
   exit 0
 fi
+
+case "$REPO" in
+  __*) REPO="$(printenv CFSM_AGENT_REPO || true)" ;; # 没有被 Worker 填好：改用环境变量
+esac
+[ -n "$REPO" ] || die "没有指定发布仓库：请设置环境变量 CFSM_AGENT_REPO，格式 用户名/CFSM-Lite-Agent"
+case "$REPO" in
+  */*) ;;
+  *) die "发布仓库格式不对，应为 用户名/CFSM-Lite-Agent" ;;
+esac
+case "$REPO" in *[!A-Za-z0-9_./-]*) die "发布仓库里含有不支持的字符" ;; esac
 
 command -v curl >/dev/null 2>&1 || die "需要先安装 curl"
 [ -n "$ID" ] && [ -n "$SECRET" ] && [ -n "$URL" ] || die "缺少参数：-i 节点ID  -s 上报密钥  -u 上报地址"

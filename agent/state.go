@@ -21,6 +21,8 @@ type state struct {
 	LastTX uint64 `json:"last_tx"`
 	Init   bool   `json:"init"`
 	CalID  string `json:"cal_id"` // 最近一次应用的手动校准编号，避免同一次校准重复应用
+
+	lastAt time.Time // 上一次累计所用读数的采集时间（只在内存里，用来丢弃过期的读数）
 }
 
 func loadState(path string) *state {
@@ -79,9 +81,15 @@ func (c config) rule() resetRule {
 }
 
 // advance 用最新的网卡累计值更新当月累计流量。
+// now 是这组读数的采集时间。HTTP 上报循环采完读数后还要等 Ping 结束才会调用这里，期间实时推送协程可能已经用更新的读数累计过了；
+// 这时再用较早的读数，会被当成「计数器被重置」而把整个网卡累计值加进当月流量，所以比上次更早的读数直接丢弃。
 func (s *state) advance(rawRX, rawTX uint64, now time.Time, rule resetRule, iface string) {
 	stMu.Lock()
 	defer stMu.Unlock()
+	if !s.lastAt.IsZero() && now.Before(s.lastAt) {
+		return
+	}
+	s.lastAt = now
 	if s.Iface != iface {
 		s.Iface = iface
 		s.Init = false

@@ -25,8 +25,8 @@ type config struct {
 	CalPeriod      string         // 校准所属的统计周期；周期已经过去的校准不再应用
 	Interface      string
 	PingMode       string
-	ConnMode       string        // auto：有人在看时实时推送，其余时间 HTTP POST；http：只用 HTTP POST
-	WSSInterval    time.Duration // 实时推送的间隔（1 到 5 秒）；实际以服务端通知的为准
+	ConnMode       string            // auto：有人在看时实时推送，其余时间 HTTP POST；http：只用 HTTP POST
+	WSSInterval    time.Duration     // 实时推送的间隔（1 到 5 秒）；实际以服务端通知的为准
 	Targets        map[string]string // ct、cu、cm、bd 四个探测目标
 }
 

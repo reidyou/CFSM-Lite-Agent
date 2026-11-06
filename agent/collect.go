@@ -65,7 +65,13 @@ type snapshot struct {
 	rx, tx            uint64
 }
 
+// snapMu 让「读取计数器 + 记录时间」成为一个整体：两个协程同时采样时，时间靠后的读数一定是后读到的，
+// 这样 state.advance 才能靠时间先后可靠地丢弃过期读数。
+var snapMu sync.Mutex
+
 func readSnapshot(only map[string]bool) snapshot {
+	snapMu.Lock()
+	defer snapMu.Unlock()
 	total, idle, bt := parseProcStat(readFileString("/proc/stat"))
 	rx, tx := parseNetDev(readFileString("/proc/net/dev"), only)
 	return snapshot{at: time.Now(), cpuTotal: total, cpuIdle: idle, btime: bt, rx: rx, tx: tx}

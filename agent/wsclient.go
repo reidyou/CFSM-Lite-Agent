@@ -33,12 +33,16 @@ type wsConn struct {
 // handshakeError 带着服务端返回的 HTTP 状态码，调用方据此决定多久之后重试。
 type handshakeError struct{ Status int }
 
-func (e *handshakeError) Error() string { return fmt.Sprintf("WebSocket 握手失败：HTTP %d", e.Status) }
+func (e *handshakeError) Error() string {
+	return fmt.Sprintf("WebSocket 握手失败：HTTP %d", e.Status)
+}
 
 // closeError 表示对端主动关闭了连接，Code 是关闭码。
 type closeError struct{ Code int }
 
-func (e *closeError) Error() string { return fmt.Sprintf("连接被服务端关闭（代码 %d）", e.Code) }
+func (e *closeError) Error() string {
+	return fmt.Sprintf("连接被服务端关闭（代码 %d）", e.Code)
+}
 
 func wsAccept(key string) string {
 	sum := sha1.Sum([]byte(key + wsGUID))

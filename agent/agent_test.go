@@ -457,9 +457,9 @@ func TestParseConfigResetAndCalibration(t *testing.T) {
 		"report_interval=60&reset_hour=x",
 		"report_interval=60&timezone=Mars/Base",
 		"report_interval=60&timezone=+08:00",
-		"report_interval=60&cal_id=1&cal_rx=1",                                   // 缺 cal_tx 和 cal_period
-		"report_interval=60&cal_id=1&cal_rx=-1&cal_tx=1&cal_period=none",         // 负数
-		"report_interval=60&cal_id=1&cal_rx=1&cal_tx=1&cal_period=bad",           // 周期格式不对
+		"report_interval=60&cal_id=1&cal_rx=1",                                  // 缺 cal_tx 和 cal_period
+		"report_interval=60&cal_id=1&cal_rx=-1&cal_tx=1&cal_period=none",        // 负数
+		"report_interval=60&cal_id=1&cal_rx=1&cal_tx=1&cal_period=bad",          // 周期格式不对
 		"report_interval=60&cal_id=abc&cal_rx=1&cal_tx=1&cal_period=2026-11-01", // 编号不是数字
 	} {
 		if _, err := parseConfig(bad, cur); err == nil {
@@ -498,5 +498,27 @@ func TestStateCalibrate(t *testing.T) {
 	s.calibrate(cfg)
 	if s.RX != 0 || s.TX != 0 || s.CalID != "101" {
 		t.Fatalf("recalibration failed: %+v", s)
+	}
+}
+
+// 实时协程已经用较新的读数累计过，HTTP 上报循环随后拿着较早采到的读数再来累计：
+// 较早的读数必须被丢弃，不能被当成计数器重置而把整个网卡累计值加进当月流量。
+func TestStateAdvanceIgnoresStaleSnapshot(t *testing.T) {
+	rule := resetRule{Day: 1}
+	s := &state{}
+	t0 := time.Date(2026, 10, 10, 12, 0, 0, 0, time.UTC)
+	s.advance(1_000_000_000, 500_000_000, t0, rule, "")
+	s.advance(1_000_001_000, 500_000_500, t0.Add(6*time.Second), rule, "") // 实时帧：较新的读数
+	s.advance(1_000_000_400, 500_000_200, t0.Add(time.Second), rule, "")   // HTTP 循环：几秒前采的读数
+	if s.RX != 1000 || s.TX != 500 {
+		t.Fatalf("stale snapshot must be ignored, got RX=%d TX=%d", s.RX, s.TX)
+	}
+	s.advance(1_000_001_600, 500_000_900, t0.Add(8*time.Second), rule, "") // 之后的正常读数继续累计
+	if s.RX != 1600 || s.TX != 900 {
+		t.Fatalf("after stale: RX=%d TX=%d", s.RX, s.TX)
+	}
+	s.advance(100, 50, t0.Add(9*time.Second), rule, "") // 真正的计数器重置（读数是新的）仍按重置处理
+	if s.RX != 1700 || s.TX != 950 {
+		t.Fatalf("real reset: RX=%d TX=%d", s.RX, s.TX)
 	}
 }
