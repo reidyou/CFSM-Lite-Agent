@@ -522,3 +522,82 @@ func TestStateAdvanceIgnoresStaleSnapshot(t *testing.T) {
 		t.Fatalf("real reset: RX=%d TX=%d", s.RX, s.TX)
 	}
 }
+
+// 重启后用状态文件里保存的服务端配置接着累计：重置日不是默认值（1 日）、统计网卡不是默认值时，当月流量不能被清零。
+func TestRestartKeepsMonthlyTraffic(t *testing.T) {
+	path := t.TempDir() + "/state.json"
+	body := "report_interval=60&reset_day=5&interface=eth0"
+	old := &state{Period: "2026-11-05", Iface: "eth0", RX: 1000, TX: 2000, LastRX: 5000, LastTX: 6000, Init: true}
+	old.setCfg(body)
+	if err := old.save(path); err != nil {
+		t.Fatal(err)
+	}
+
+	// 模拟重启：重新读状态文件，用其中保存的配置，而不是默认配置
+	st := loadState(path)
+	cfg, err := parseConfig(st.cachedCfg(), defaultConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Synced || cfg.ResetDay != 5 || cfg.Interface != "eth0" {
+		t.Fatalf("restored config: %+v", cfg)
+	}
+	t0 := time.Date(2026, 11, 6, 12, 0, 0, 0, time.UTC)
+	a := snapshot{at: t0, rx: 5000, tx: 6000}
+	b := snapshot{at: t0.Add(time.Second), rx: 5500, tx: 6300}
+	m := buildMetrics(a, b, cfg, st, map[string]any{}, map[string]any{})
+	if m["net_rx_monthly"] != uint64(1500) || m["net_tx_monthly"] != uint64(2300) {
+		t.Fatalf("monthly traffic must continue, got rx=%v tx=%v", m["net_rx_monthly"], m["net_tx_monthly"])
+	}
+}
+
+// 还没拿到服务端配置（例如从没保存过配置的旧版本升级）时，不能用默认配置累计，也不能清零已有的累计。
+func TestUnsyncedConfigKeepsState(t *testing.T) {
+	st := &state{Period: "2026-11-05", Iface: "eth0", RX: 1000, TX: 2000, LastRX: 5000, LastTX: 6000, Init: true}
+	cfg := defaultConfig()
+	if cfg.Synced {
+		t.Fatal("default config must not count as synced")
+	}
+	t0 := time.Date(2026, 11, 6, 12, 0, 0, 0, time.UTC)
+	a := snapshot{at: t0, rx: 5000, tx: 6000}
+	b := snapshot{at: t0.Add(time.Second), rx: 5500, tx: 6300}
+	m := buildMetrics(a, b, cfg, st, map[string]any{}, map[string]any{})
+	if m["net_rx_monthly"] != uint64(1000) || m["net_tx_monthly"] != uint64(2000) {
+		t.Fatalf("unsynced run must report stored totals, got rx=%v tx=%v", m["net_rx_monthly"], m["net_tx_monthly"])
+	}
+	if st.Period != "2026-11-05" || st.Iface != "eth0" || !st.Init || st.LastRX != 5000 || st.LastTX != 6000 {
+		t.Fatalf("state must be untouched before config sync: %+v", st)
+	}
+	// 配置同步之后的第一次累计，把这段时间网卡计数器的增量一起补上
+	synced, err := parseConfig("report_interval=60&reset_day=5&interface=eth0", cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m = buildMetrics(a, b, synced, st, map[string]any{}, map[string]any{})
+	if m["net_rx_monthly"] != uint64(1500) || m["net_tx_monthly"] != uint64(2300) {
+		t.Fatalf("after sync got rx=%v tx=%v", m["net_rx_monthly"], m["net_tx_monthly"])
+	}
+}
+
+// 服务端配置原文随状态文件保存；没有变化时不会重复标记为「待写入」。
+func TestStateCfgPersisted(t *testing.T) {
+	path := t.TempDir() + "/state.json"
+	s := &state{}
+	s.setCfg("report_interval=60&reset_day=5")
+	if !s.isDirty() {
+		t.Fatal("new config must mark state dirty")
+	}
+	if err := s.save(path); err != nil {
+		t.Fatal(err)
+	}
+	if s.isDirty() {
+		t.Fatal("save must clear dirty")
+	}
+	s.setCfg("report_interval=60&reset_day=5")
+	if s.isDirty() {
+		t.Fatal("same config must not mark dirty")
+	}
+	if got := loadState(path).cachedCfg(); got != "report_interval=60&reset_day=5" {
+		t.Fatalf("cached config = %q", got)
+	}
+}

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -21,8 +22,10 @@ type state struct {
 	LastTX uint64 `json:"last_tx"`
 	Init   bool   `json:"init"`
 	CalID  string `json:"cal_id"` // 最近一次应用的手动校准编号，避免同一次校准重复应用
+	Cfg    string `json:"cfg"`    // 最近一次应用的服务端配置原文；重启后先用它，不用默认配置，否则重置日、时区、网卡不同的节点会被误清零
 
 	lastAt time.Time // 上一次累计所用读数的采集时间（只在内存里，用来丢弃过期的读数）
+	dirty  bool      // 内存里有尚未写入文件的变化（只在内存里）
 }
 
 func loadState(path string) *state {
@@ -47,10 +50,21 @@ func (s *state) save(path string) error {
 	}
 	stMu.Lock()
 	b, err := json.Marshal(s)
+	s.dirty = false
 	stMu.Unlock()
 	if err != nil {
 		return err
 	}
+	if err := writeFileAtomic(path, b); err != nil {
+		stMu.Lock()
+		s.dirty = true // 没写成功，下次还要再写
+		stMu.Unlock()
+		return err
+	}
+	return nil
+}
+
+func writeFileAtomic(path string, b []byte) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
@@ -59,6 +73,47 @@ func (s *state) save(path string) error {
 		return err
 	}
 	return os.Rename(tmp, path)
+}
+
+// isDirty 返回内存里的状态是否比文件新。
+func (s *state) isDirty() bool {
+	stMu.Lock()
+	defer stMu.Unlock()
+	return s.dirty
+}
+
+// setCfg 记下最近一次应用的服务端配置原文，随状态文件一起保存。
+func (s *state) setCfg(body string) {
+	stMu.Lock()
+	defer stMu.Unlock()
+	if s.Cfg != body {
+		s.Cfg = body
+		s.dirty = true
+	}
+}
+
+// cachedCfg 返回上次保存的服务端配置原文；没有则为空串。
+func (s *state) cachedCfg() string {
+	stMu.Lock()
+	defer stMu.Unlock()
+	return s.Cfg
+}
+
+// saveLoop 定时把有变化的状态写入文件。实时推送协程也会累计流量但不写文件，
+// 没有它的话，重启（尤其是升级时重新安装）会丢掉最近一个上报间隔内的流量。
+func saveLoop(ctx context.Context, s *state, path string, every time.Duration) {
+	t := time.NewTicker(every)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			if s.isDirty() {
+				_ = s.save(path)
+			}
+		}
+	}
 }
 
 // delta 计算两次读数之间的增量；当前值小于上次说明计数器被重置（重启、网卡重建），此时整个当前值都是新增量。
@@ -103,6 +158,7 @@ func (s *state) advance(rawRX, rawTX uint64, now time.Time, rule resetRule, ifac
 		s.TX += delta(rawTX, s.LastTX)
 	}
 	s.LastRX, s.LastTX, s.Init = rawRX, rawTX, true
+	s.dirty = true
 }
 
 func daysIn(y int, m time.Month, loc *time.Location) int {
@@ -152,6 +208,7 @@ func (s *state) calibrate(cfg config) {
 		return
 	}
 	s.RX, s.TX, s.CalID = cfg.CalRX, cfg.CalTX, cfg.CalID
+	s.dirty = true
 }
 
 // monthly 返回当前统计周期内累计的下行、上行字节数。

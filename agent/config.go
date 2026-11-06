@@ -28,6 +28,9 @@ type config struct {
 	ConnMode       string            // auto：有人在看时实时推送，其余时间 HTTP POST；http：只用 HTTP POST
 	WSSInterval    time.Duration     // 实时推送的间隔（1 到 5 秒）；实际以服务端通知的为准
 	Targets        map[string]string // ct、cu、cm、bd 四个探测目标
+	// Synced 表示这份配置来自服务端（刚收到的，或上次保存在状态文件里的）。默认配置里是 false：
+	// 此时重置日、时区、统计网卡都可能和服务端不一致，不能拿来累计当月流量，否则会把已有的累计误清零。
+	Synced         bool
 }
 
 var slotKeys = []string{"ct", "cu", "cm", "bd"}
@@ -176,5 +179,6 @@ func parseConfig(body string, cur config) (config, error) {
 			next.Targets[k] = v
 		}
 	}
+	next.Synced = true
 	return next, nil
 }

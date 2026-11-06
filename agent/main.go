@@ -95,6 +95,17 @@ func main() {
 func run(ctx context.Context, s settings) {
 	st := loadState(s.StatePath)
 	box := newCfgBox()
+	// 先恢复上次保存的服务端配置：重置日、时区、统计网卡与服务端一致，重启后才能接着累计当月流量
+	if body := st.cachedCfg(); body != "" {
+		if c, perr := parseConfig(body, defaultConfig()); perr == nil {
+			box.set(c)
+		} else {
+			log.Printf("忽略状态文件里保存的配置: %v", perr)
+		}
+	}
+	// 退出（重启、升级时的 SIGTERM）前再写一次，实时推送期间累计的流量也不会丢
+	defer func() { _ = st.save(s.StatePath) }()
+	go saveLoop(ctx, st, s.StatePath, 30*time.Second)
 	sh := &sharedData{}
 	rep := newReporter(s)
 	cfgMD5 := "none"
@@ -132,6 +143,10 @@ func run(ctx context.Context, s settings) {
 				} else {
 					cfg = next
 					box.set(cfg)
+					st.setCfg(strings.TrimSpace(res.Body))
+					if err := st.save(s.StatePath); err != nil && s.Debug {
+						log.Printf("保存状态文件失败: %v", err)
+					}
 					cfgMD5 = md5Hex(res.Body) // Worker 对完整响应体计算 MD5，这里原样回传
 					log.Printf("已应用新配置：上报间隔 %s，重置 每月%d日 %02d:%02d（%s），连接模式 %s", cfg.ReportInterval, cfg.ResetDay, cfg.ResetHour, cfg.ResetMinute, cfg.TZName, cfg.ConnMode)
 					wait = cfg.ReportInterval
