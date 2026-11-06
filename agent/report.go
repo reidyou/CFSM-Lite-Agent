@@ -47,7 +47,7 @@ func (r *reporter) send(ctx context.Context, metrics map[string]any, cfgMD5 stri
 		return reply{}, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Agent-Version", "lite-go-"+version)
+	req.Header.Set("X-Agent-Version", "Lite-agent-"+version)
 	req.Header.Set("X-Agent-Config-Schema", "7")
 	req.Header.Set("X-Agent-Config-Md5", cfgMD5)
 	resp, err := r.client.Do(req)

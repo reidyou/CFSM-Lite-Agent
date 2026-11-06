@@ -467,7 +467,7 @@ func TestReporterSend(t *testing.T) {
 	if gotHeader.Get("X-Agent-Config-Schema") != "7" || gotHeader.Get("X-Agent-Config-Md5") != "none" {
 		t.Fatalf("headers: %v", gotHeader)
 	}
-	if !strings.HasPrefix(gotHeader.Get("X-Agent-Version"), "lite-go-") {
+	if !strings.HasPrefix(gotHeader.Get("X-Agent-Version"), "Lite-agent-") {
 		t.Fatalf("version header: %q", gotHeader.Get("X-Agent-Version"))
 	}
 	if gotBody["id"] != "abc" || gotBody["secret"] != "s3cret" {

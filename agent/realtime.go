@@ -113,7 +113,7 @@ func realtimeSession(ctx context.Context, s settings, box *cfgBox, st *state, sh
 	hdr := http.Header{}
 	hdr.Set("Authorization", "Bearer "+s.Secret)
 	hdr.Set("X-Agent-Id", s.ID)
-	hdr.Set("X-Agent-Version", "lite-go-"+version)
+	hdr.Set("X-Agent-Version", "Lite-agent-"+version)
 	conn, err := dialWS(ctx, s.URL, hdr)
 	if err != nil {
 		return err
