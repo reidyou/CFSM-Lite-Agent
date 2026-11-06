@@ -62,7 +62,8 @@ type snapshot struct {
 	at                time.Time
 	cpuTotal, cpuIdle uint64
 	btime             int64
-	rx, tx            uint64
+	rx, tx            uint64                // 所有统计网卡的合计值（算网速用）
+	ifs               map[string]ifCounters // 每块统计网卡各自的值（累计当月流量用）
 }
 
 // snapMu 让「读取计数器 + 记录时间」成为一个整体：两个协程同时采样时，时间靠后的读数一定是后读到的，
@@ -73,8 +74,13 @@ func readSnapshot(only map[string]bool) snapshot {
 	snapMu.Lock()
 	defer snapMu.Unlock()
 	total, idle, bt := parseProcStat(readFileString("/proc/stat"))
-	rx, tx := parseNetDev(readFileString("/proc/net/dev"), only)
-	return snapshot{at: time.Now(), cpuTotal: total, cpuIdle: idle, btime: bt, rx: rx, tx: tx}
+	ifs := parseNetDevIfaces(readFileString("/proc/net/dev"), only)
+	var rx, tx uint64
+	for _, c := range ifs {
+		rx += c.RX
+		tx += c.TX
+	}
+	return snapshot{at: time.Now(), cpuTotal: total, cpuIdle: idle, btime: bt, rx: rx, tx: tx, ifs: ifs}
 }
 
 func countProcesses() int {
@@ -165,7 +171,7 @@ func buildMetrics(a, b snapshot, cfg config, st *state, heavy, ping map[string]a
 	// 默认配置的重置日、时区、网卡可能和服务端不同，用它累计会清零或重建基线。
 	// 等配置同步后，下一次累计会把这段时间内网卡计数器的增量一并补上。
 	if cfg.Synced {
-		st.advance(b.rx, b.tx, b.at, cfg.rule(), cfg.Interface)
+		st.advance(b.ifs, b.at, cfg.rule(), cfg.Interface)
 		st.calibrate(cfg)
 	}
 	rxMonthly, txMonthly := st.monthly()

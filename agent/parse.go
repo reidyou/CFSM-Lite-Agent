@@ -141,8 +141,26 @@ func splitIfaces(s string) map[string]bool {
 	return m
 }
 
-// parseNetDev 解析 /proc/net/dev，返回累计接收和发送字节数。only 非空时只统计指定网卡。
+// ifCounters 是一块网卡自开机（或自创建）以来的累计接收、发送字节数。
+type ifCounters struct {
+	RX uint64 `json:"rx"`
+	TX uint64 `json:"tx"`
+}
+
+// parseNetDev 解析 /proc/net/dev，返回累计接收和发送字节数（所有统计网卡之和）。only 非空时只统计指定网卡。
 func parseNetDev(text string, only map[string]bool) (rx, tx uint64) {
+	for _, c := range parseNetDevIfaces(text, only) {
+		rx += c.RX
+		tx += c.TX
+	}
+	return rx, tx
+}
+
+// parseNetDevIfaces 解析 /proc/net/dev，返回每块统计网卡各自的累计值。
+// 累计流量必须按网卡分别算增量：只看合计值的话，一块网卡消失（虚拟机、容器、VPN 隧道停止）时合计值会变小，
+// 会被误当成「计数器被重置」，把剩下所有网卡的整个累计值当成新增流量。
+func parseNetDevIfaces(text string, only map[string]bool) map[string]ifCounters {
+	out := map[string]ifCounters{}
 	sc := bufio.NewScanner(strings.NewReader(text))
 	for sc.Scan() {
 		line := sc.Text()
@@ -167,10 +185,9 @@ func parseNetDev(text string, only map[string]bool) (rx, tx uint64) {
 		if err1 != nil || err2 != nil {
 			continue
 		}
-		rx += r
-		tx += t
+		out[name] = ifCounters{RX: r, TX: t}
 	}
-	return rx, tx
+	return out
 }
 
 func parseLoadavg(text string) string {

@@ -11,8 +11,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -22,12 +24,34 @@ import (
 const (
 	wsGUID     = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 	wsMaxFrame = 1 << 20 // 单个帧或单条消息的上限（1MB），避免对端异常时撑爆内存
+
+	wsDialTimeout = 10 * time.Second // 建立 TCP 连接的超时
+)
+
+// 下面两个用变量，只是为了让测试可以缩短等待时间；正常运行时不会修改。
+var (
+	wsWriteTimeout = 8 * time.Second // 写一个帧的超时：超时就关闭底层连接，不会一直卡在写上
+	wsCloseTimeout = 2 * time.Second // 关闭连接时发送关闭帧的最长等待
 )
 
 type wsConn struct {
-	rwc io.ReadWriteCloser
-	br  *bufio.Reader
-	wmu sync.Mutex // 写帧需要互斥：主循环发数据，读取协程回 pong
+	rwc      io.ReadWriteCloser
+	br       *bufio.Reader
+	wmu      sync.Mutex   // 写帧需要互斥：主循环发数据，读取协程回 pong
+	lastRecv atomic.Int64 // 最近一次收到任何帧（包括 ping、pong）的时间，UnixNano；0 表示还没有
+	closeOne sync.Once
+}
+
+// touch 记录刚刚收到了数据。
+func (c *wsConn) touch() { c.lastRecv.Store(time.Now().UnixNano()) }
+
+// sinceRecv 返回距离上次收到数据过了多久；还没收到过任何数据时返回 0，由调用方自己用连接时间兜底。
+func (c *wsConn) sinceRecv() time.Duration {
+	v := c.lastRecv.Load()
+	if v == 0 {
+		return 0
+	}
+	return time.Since(time.Unix(0, v))
 }
 
 // handshakeError 带着服务端返回的 HTTP 状态码，调用方据此决定多久之后重试。
@@ -73,11 +97,15 @@ func dialWS(ctx context.Context, rawURL string, hdr http.Header) (*wsConn, error
 
 	tr := &http.Transport{
 		Proxy: http.ProxyFromEnvironment,
+		// 不设置 DialContext 的话建立 TCP 连接没有超时，网络不通时每次重连要等系统默认的两分钟
+		DialContext: (&net.Dialer{Timeout: wsDialTimeout, KeepAlive: 30 * time.Second}).DialContext,
 		// 协议升级只能走 HTTP/1.1，所以关闭 HTTP/2
 		TLSNextProto:          map[string]func(string, *tls.Conn) http.RoundTripper{},
 		TLSHandshakeTimeout:   10 * time.Second,
 		ResponseHeaderTimeout: 15 * time.Second,
 		DisableCompression:    true,
+		// 每次重连都新建 Transport：握手没成功时不要把连接留在空闲池里
+		DisableKeepAlives: true,
 	}
 	client := &http.Client{
 		Transport:     tr,
@@ -100,13 +128,21 @@ func dialWS(ctx context.Context, rawURL string, hdr http.Header) (*wsConn, error
 		_ = resp.Body.Close()
 		return nil, errors.New("连接不支持协议升级")
 	}
-	return &wsConn{rwc: rwc, br: bufio.NewReader(rwc)}, nil
+	c := &wsConn{rwc: rwc, br: bufio.NewReader(rwc)}
+	c.touch() // 握手成功算作第一次收到数据
+	return c, nil
 }
 
 // writeFrame 发送一个带掩码的完整帧（客户端发出的帧必须带掩码）。
-func (c *wsConn) writeFrame(opcode byte, payload []byte) error {
+// timeout 大于 0 时，超时还没写完就关闭底层连接让写入失败：连接拿到的是 http 升级后的读写器，设置不了写超时，
+// 对端网络卡死时写入会一直阻塞，同时占着写锁，Close 也会跟着卡住。
+func (c *wsConn) writeFrame(opcode byte, payload []byte, timeout time.Duration) error {
 	c.wmu.Lock()
 	defer c.wmu.Unlock()
+	if timeout > 0 {
+		t := time.AfterFunc(timeout, func() { _ = c.rwc.Close() })
+		defer t.Stop()
+	}
 	n := len(payload)
 	hdr := make([]byte, 0, 14)
 	hdr = append(hdr, 0x80|opcode)
@@ -136,12 +172,17 @@ func (c *wsConn) writeFrame(opcode byte, payload []byte) error {
 }
 
 // WriteText 发送一条文本消息。
-func (c *wsConn) WriteText(s string) error { return c.writeFrame(0x1, []byte(s)) }
+func (c *wsConn) WriteText(s string) error { return c.writeFrame(0x1, []byte(s), wsWriteTimeout) }
 
 // Close 先尽力发一个正常关闭帧（代码 1000），再关闭底层连接；对正在阻塞的读取也会立即生效。
+// 关闭帧最多等 wsCloseTimeout：对端卡死时不能让 Close 一直等下去，否则重连逻辑会跟着卡住。
 func (c *wsConn) Close() {
-	_ = c.writeFrame(0x8, []byte{0x03, 0xE8})
-	_ = c.rwc.Close()
+	c.closeOne.Do(func() {
+		t := time.AfterFunc(wsCloseTimeout, func() { _ = c.rwc.Close() })
+		_ = c.writeFrame(0x8, []byte{0x03, 0xE8}, 0)
+		t.Stop()
+		_ = c.rwc.Close()
+	})
 }
 
 func (c *wsConn) readFrame() (fin bool, opcode byte, payload []byte, err error) {
@@ -149,6 +190,7 @@ func (c *wsConn) readFrame() (fin bool, opcode byte, payload []byte, err error) 
 	if _, err = io.ReadFull(c.br, h[:]); err != nil {
 		return
 	}
+	c.touch()
 	fin = h[0]&0x80 != 0
 	opcode = h[0] & 0x0F
 	masked := h[1]&0x80 != 0
@@ -204,10 +246,10 @@ func (c *wsConn) ReadText() (string, error) {
 			if len(p) >= 2 {
 				code = int(binary.BigEndian.Uint16(p[:2]))
 			}
-			_ = c.writeFrame(0x8, p)
+			_ = c.writeFrame(0x8, p, wsCloseTimeout)
 			return "", &closeError{Code: code}
 		case 0x9:
-			if werr := c.writeFrame(0xA, p); werr != nil {
+			if werr := c.writeFrame(0xA, p, wsWriteTimeout); werr != nil {
 				return "", werr
 			}
 		case 0xA:

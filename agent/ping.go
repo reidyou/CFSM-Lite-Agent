@@ -3,8 +3,8 @@ package main
 import (
 	"context"
 	"errors"
+	"log"
 	"net"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -13,20 +13,27 @@ import (
 
 // 延迟与丢包的采集和计算方式参照 komari-agent：每个样本只探测一次（TCP 握手，超时 3 秒），
 // 失败记为丢包；握手耗时超过 1 秒时重测，疑似 SYN 重传的样本也记为丢包（见 measureSample）。
+// 域名解析也与 komari 一致：取系统解析器返回的第一个地址，不再强行优先 IPv4（见 resolveHost）。
 // 丢包率不是在一次探测里算，而是在一段时间的大量样本上统计：komari 由面板统计，
 // Lite 的服务端只保存最新值，所以样本留在 Agent 里，按滑动窗口统计后随指标上报。
+// 统计口径同样与 komari 面板一致：丢包率 = 失败样本数 ÷ 总样本数，延迟 = 成功样本的平均值。
 const (
-	pingTimeout       = 3 * time.Second  // 单次连接超时
-	pingInterval      = 10 * time.Second // 每个目标的采样间隔
-	pingLossWindow    = 10 * time.Minute // 丢包率统计窗口
-	pingLatencyWindow = time.Minute      // 延迟（取中位数）统计窗口
-	pingMaxSamples    = 360              // 每个目标最多保留的样本数
-	pingFirstWait     = 15 * time.Second // 第一次上报前最多等多久，让每个目标至少有一个样本
+	pingTimeout        = 3 * time.Second  // 单次连接超时
+	pingResolveTimeout = 10 * time.Second // 域名解析超时（komari 解析没有单独的超时，这里只防止卡死）
+	pingInterval       = 10 * time.Second // 每个目标的采样间隔
+	pingLossWindow     = time.Hour        // 丢包率统计窗口（komari 面板按小时级窗口统计，10 分钟只有 60 个样本，波动太大）
+	pingLatencyWindow  = 10 * time.Minute // 延迟（取平均值）统计窗口
+	pingMaxSamples     = 400              // 每个目标最多保留的样本数（1 小时 + 余量）
+	pingFirstWait      = 15 * time.Second // 第一次上报前最多等多久，让每个目标至少有一个样本
 
 	pingHighMs    = 1000 // 耗时超过这个值（毫秒）就重测
 	pingRetries   = 3    // 重测次数上限
 	pingRetryDrop = 800  // 重测耗时比首次少这么多（毫秒）以上，认为首次遇到了 SYN 重传：首次 1000ms 的重传超时减去 200ms 抖动
 )
+
+// pingDebug 为 true 时（启动参数 -debug）把每个样本的解析结果、耗时和失败原因写进日志，
+// 用来和 komari 对比：同一台机器上两边解析到的 IP（尤其是 IPv4 还是 IPv6）和目标端口必须一致。
+var pingDebug bool
 
 var (
 	errResolve    = errors.New("failed to resolve target")
@@ -65,22 +72,21 @@ func normalizeTarget(t string) (host, port string, ok bool) {
 	return h, p, true
 }
 
+// resolveHost 解析域名，做法与 komari-agent 的 resolveIP 一致：取系统解析器返回的第一个地址。
+// Go 的解析器会按 RFC 6724 排序：本机有可用的 IPv6 时 IPv6 排在前面，没有时 IPv4 排在前面。
+// 以前这里强行优先 IPv4，在默认目标（*-dualstack 双栈域名）上会和 komari 走不同的网络路径，
+// 延迟和丢包自然对不上。
 func resolveHost(ctx context.Context, host string) (string, bool) {
 	if ip := net.ParseIP(host); ip != nil {
 		return ip.String(), true
 	}
-	rctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	rctx, cancel := context.WithTimeout(ctx, pingResolveTimeout)
 	defer cancel()
-	addrs, err := net.DefaultResolver.LookupIPAddr(rctx, host)
+	addrs, err := net.DefaultResolver.LookupHost(rctx, host)
 	if err != nil || len(addrs) == 0 {
 		return "", false
 	}
-	for _, a := range addrs {
-		if a.IP.To4() != nil {
-			return a.IP.String(), true
-		}
-	}
-	return addrs[0].IP.String(), true
+	return addrs[0], true
 }
 
 // tcpPing 测一次 TCP 握手耗时。域名先解析，耗时只计算握手；连接失败（包括被拒绝）都返回错误，与 komari 一致。
@@ -88,6 +94,9 @@ func tcpPing(ctx context.Context, host, port string) (time.Duration, error) {
 	ip, ok := resolveHost(ctx, host)
 	if !ok {
 		return 0, errResolve
+	}
+	if pingDebug {
+		log.Printf("ping 解析 %s -> %s", host, ip)
 	}
 	d := net.Dialer{Timeout: pingTimeout}
 	t0 := time.Now()
@@ -227,13 +236,14 @@ func (p *pinger) buildLocked() map[string]any {
 }
 
 // summarize 统计一个目标的样本：丢包率 = 丢包窗口内失败数 ÷ 总数；
-// 延迟 = 延迟窗口内成功样本的中位数，窗口内没有成功样本时为 nil（超时）。
+// 延迟 = 延迟窗口内成功样本的平均值（komari 面板的延迟统计也是平均值），窗口内没有成功样本时为 nil（超时）。
 // 丢包窗口内没有任何样本时 ok 为 false。
 func summarize(samples []pingSample, now time.Time) (latency any, loss float64, ok bool) {
 	lossCut := now.Add(-pingLossWindow)
 	latCut := now.Add(-pingLatencyWindow)
 	total, failed := 0, 0
-	var recent []float64
+	var sum float64
+	nOK := 0
 	for _, s := range samples {
 		if s.at.Before(lossCut) {
 			continue
@@ -242,23 +252,18 @@ func summarize(samples []pingSample, now time.Time) (latency any, loss float64, 
 		if !s.ok {
 			failed++
 		} else if !s.at.Before(latCut) {
-			recent = append(recent, s.ms)
+			sum += s.ms
+			nOK++
 		}
 	}
 	if total == 0 {
 		return nil, 0, false
 	}
 	loss = round1(float64(failed) * 100 / float64(total))
-	if len(recent) == 0 {
+	if nOK == 0 {
 		return nil, loss, true
 	}
-	sort.Float64s(recent)
-	n := len(recent)
-	med := recent[n/2]
-	if n%2 == 0 {
-		med = (recent[n/2-1] + recent[n/2]) / 2
-	}
-	return round1(med), loss, true
+	return round1(sum / float64(nOK)), loss, true
 }
 
 // run 为四个槽位各起一个协程，持续采样直到 ctx 结束。
@@ -286,6 +291,13 @@ func (p *pinger) runSlot(ctx context.Context, slot string, box *cfgBox) {
 			d, err := measureSample(func() (time.Duration, error) { return tcpPing(ctx, host, port) })
 			if ctx.Err() != nil {
 				return
+			}
+			if pingDebug {
+				if err != nil {
+					log.Printf("ping[%s] %s 记为丢包: %v", slot, target, err)
+				} else {
+					log.Printf("ping[%s] %s %.1fms", slot, target, float64(d)/float64(time.Millisecond))
+				}
 			}
 			p.record(slot, target, started, d, err == nil)
 		}

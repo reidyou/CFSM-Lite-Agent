@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"sync"
@@ -32,9 +33,18 @@ func (b *cfgBox) set(c config) {
 }
 
 const (
-	rtKeepalive  = 25 * time.Second // 空闲时每隔多久发一次 ping，防止连接被中间设备判定为空闲而断开
-	rtModeCheck  = 5 * time.Second  // 多久检查一次「连接模式」是否被改成了仅 HTTP
+	rtModeCheck  = 5 * time.Second // 多久检查一次「连接模式」是否被改成了仅 HTTP
 	rtMaxBackoff = 5 * time.Minute
+)
+
+// 用变量只是为了让测试可以缩短时间；正常运行时不会修改。
+var (
+	rtKeepalive = 25 * time.Second // 空闲时每隔多久发一次 ping，防止连接被中间设备判定为空闲而断开
+	// 超过这么久没收到服务端的任何数据就判定连接已死并重连。
+	// 服务端会对每个 ping 立刻回 pong，所以正常情况下至少每 25 秒收到一次；留出两个周期再加 10 秒的余量。
+	// 没有这个检查时，NAT 超时或网络切换造成的「半死连接」要等 TCP 重传放弃（Linux 默认约 15 分钟）才会被发现，
+	// 期间这台节点收不到 activate，看盘时一直只有每分钟一次的刷新。
+	rtDeadAfter = 2*rtKeepalive + 10*time.Second
 )
 
 // rtInterval 把服务端通知的秒数限制在 1 到 5 秒；不合法时用 fallback。
@@ -166,6 +176,9 @@ func realtimeSession(ctx context.Context, s settings, box *cfgBox, st *state, sh
 		case err := <-rerr:
 			return err
 		case <-keepalive.C:
+			if idle := conn.sinceRecv(); idle > rtDeadAfter {
+				return fmt.Errorf("实时连接已 %s 没有收到任何数据，判定为断开", idle.Round(time.Second))
+			}
 			if err := conn.WriteText("ping"); err != nil {
 				return err
 			}

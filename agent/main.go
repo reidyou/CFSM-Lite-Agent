@@ -45,7 +45,7 @@ func parseSettings(args []string) (s settings, showVersion bool, err error) {
 	fs.StringVar(&s.URL, "url", envOr("CFSM_URL", ""), "Worker 上报地址，例如 https://example.com/update（环境变量 CFSM_URL）")
 	fs.StringVar(&s.ID, "id", envOr("CFSM_ID", ""), "节点 ID（环境变量 CFSM_ID）")
 	fs.StringVar(&s.Secret, "secret", envOr("CFSM_SECRET", ""), "上报密钥（环境变量 CFSM_SECRET）")
-	fs.StringVar(&s.StatePath, "state", envOr("CFSM_STATE", "/var/lib/cfsm-lite/state.json"), "状态文件路径（环境变量 CFSM_STATE）")
+	fs.StringVar(&s.StatePath, "state", envOr("CFSM_STATE", "/opt/cfsm-lite/state.json"), "状态文件路径（环境变量 CFSM_STATE）")
 	fs.BoolVar(&s.AllowHTTP, "allow-http", false, "允许使用 http:// 上报（密钥会明文传输，不推荐）")
 	fs.BoolVar(&s.Debug, "debug", false, "输出调试日志")
 	fs.BoolVar(&showVersion, "version", false, "打印版本号并退出")
@@ -107,6 +107,7 @@ func run(ctx context.Context, s settings) {
 	defer func() { _ = st.save(s.StatePath) }()
 	go saveLoop(ctx, st, s.StatePath, 30*time.Second)
 	sh := &sharedData{}
+	pingDebug = s.Debug
 	go newPinger(sh).run(ctx, box) // 后台持续采样延迟和丢包，上报时只取统计结果
 	rep := newReporter(s)
 	cfgMD5 := "none"

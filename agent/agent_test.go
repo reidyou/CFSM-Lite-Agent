@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -165,23 +166,23 @@ func TestStateAdvance(t *testing.T) {
 	day1 := resetRule{Day: 1}
 	s := &state{}
 	t0 := time.Date(2026, 10, 10, 12, 0, 0, 0, time.UTC)
-	s.advance(1000, 2000, t0, day1, "")
+	s.advance(one(1000, 2000), t0, day1, "")
 	if s.RX != 0 || s.TX != 0 {
 		t.Fatalf("first sample only sets the baseline: %+v", s)
 	}
-	s.advance(1500, 2600, t0.Add(time.Minute), day1, "")
+	s.advance(one(1500, 2600), t0.Add(time.Minute), day1, "")
 	if s.RX != 500 || s.TX != 600 {
 		t.Fatalf("after delta: %+v", s)
 	}
-	s.advance(100, 50, t0.Add(2*time.Minute), day1, "") // 计数器被重置
+	s.advance(one(100, 50), t0.Add(2*time.Minute), day1, "") // 计数器被重置
 	if s.RX != 600 || s.TX != 650 {
 		t.Fatalf("after reset: %+v", s)
 	}
-	s.advance(200, 80, time.Date(2026, 11, 1, 0, 5, 0, 0, time.UTC), day1, "") // 新周期，累计清零后再加增量
+	s.advance(one(200, 80), time.Date(2026, 11, 1, 0, 5, 0, 0, time.UTC), day1, "") // 新周期，累计清零后再加增量
 	if s.Period != "2026-11-01" || s.RX != 100 || s.TX != 30 {
 		t.Fatalf("new period: %+v", s)
 	}
-	s.advance(999999, 999999, time.Date(2026, 11, 1, 0, 6, 0, 0, time.UTC), day1, "eth0") // 网卡配置变化：重建基线，不产生巨大增量
+	s.advance(one(999999, 999999), time.Date(2026, 11, 1, 0, 6, 0, 0, time.UTC), day1, "eth0") // 网卡配置变化：重建基线，不产生巨大增量
 	if s.RX != 100 || s.TX != 30 {
 		t.Fatalf("iface change must not add traffic: %+v", s)
 	}
@@ -194,7 +195,7 @@ func TestStateSaveLoad(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := loadState(path)
-	if *got != *s {
+	if !reflect.DeepEqual(got, s) {
 		t.Fatalf("got %+v want %+v", got, s)
 	}
 	if bad := loadState(t.TempDir() + "/missing.json"); bad.Init {
@@ -307,28 +308,28 @@ func TestSummarize(t *testing.T) {
 	if _, _, has := summarize(nil, now); has {
 		t.Fatal("no samples must report ok=false")
 	}
-	// 10 个样本里 2 个失败：丢包 20%；最近 1 分钟内的成功样本取中位数
-	samples := []pingSample{ok(500, 900), bad(400), ok(300, 800), ok(200, 700), bad(100), ok(50, 210), ok(40, 190), ok(30, 200), ok(20, 205), ok(10, 195)}
+	// 10 个样本里 2 个失败：丢包 20%（1 小时窗口）；最近 10 分钟内的成功样本取平均值（210+190+200+205+195 = 1000，共 5 个）
+	samples := []pingSample{ok(2000, 900), bad(1500), ok(1000, 800), ok(900, 700), bad(800), ok(50, 210), ok(40, 190), ok(30, 200), ok(20, 205), ok(10, 195)}
 	lat, loss, has := summarize(samples, now)
 	if !has || loss != 20 || lat != 200.0 {
 		t.Fatalf("lat=%v loss=%v ok=%v", lat, loss, has)
 	}
-	// 偶数个成功样本：取中间两个的平均
-	lat, _, _ = summarize([]pingSample{ok(30, 100), ok(20, 200)}, now)
-	if lat != 150.0 {
-		t.Fatalf("even median = %v", lat)
+	// 平均值：与 komari 面板一致，异常高的样本会拉高平均值
+	lat, _, _ = summarize([]pingSample{ok(30, 100), ok(20, 200), ok(10, 600)}, now)
+	if lat != 300.0 {
+		t.Fatalf("mean = %v", lat)
 	}
-	// 最近 1 分钟全部失败：延迟为 nil（超时），丢包率仍按 10 分钟窗口算
-	lat, loss, _ = summarize([]pingSample{ok(300, 100), ok(200, 100), bad(30), bad(20), bad(10), bad(5)}, now)
+	// 最近 10 分钟全部失败：延迟为 nil（超时），丢包率仍按 1 小时窗口算
+	lat, loss, _ = summarize([]pingSample{ok(1300, 100), ok(1200, 100), bad(30), bad(20), bad(10), bad(5)}, now)
 	if lat != nil || loss != round1(400.0/6) {
 		t.Fatalf("lat=%v loss=%v", lat, loss)
 	}
 	// 窗口外的样本不计入
-	lat, loss, has = summarize([]pingSample{bad(700), ok(10, 50)}, now)
+	lat, loss, has = summarize([]pingSample{bad(4000), ok(10, 50)}, now)
 	if !has || loss != 0 || lat != 50.0 {
 		t.Fatalf("old samples counted: lat=%v loss=%v", lat, loss)
 	}
-	if _, _, has := summarize([]pingSample{bad(700)}, now); has {
+	if _, _, has := summarize([]pingSample{bad(4000)}, now); has {
 		t.Fatal("only samples outside the window must report ok=false")
 	}
 }
@@ -622,15 +623,15 @@ func TestStateCalibrate(t *testing.T) {
 	rule := resetRule{Day: 1}
 	s := &state{}
 	t0 := time.Date(2026, 11, 10, 12, 0, 0, 0, time.UTC)
-	s.advance(1000, 1000, t0, rule, "")
-	s.advance(1500, 1700, t0.Add(time.Minute), rule, "")
+	s.advance(one(1000, 1000), t0, rule, "")
+	s.advance(one(1500, 1700), t0.Add(time.Minute), rule, "")
 	cfg := defaultConfig()
 	cfg.CalID, cfg.CalRX, cfg.CalTX, cfg.CalPeriod = "100", 5000, 9000, "2026-11-01"
 	s.calibrate(cfg)
 	if s.RX != 5000 || s.TX != 9000 || s.CalID != "100" {
 		t.Fatalf("calibration not applied: %+v", s)
 	}
-	s.advance(1600, 1800, t0.Add(2*time.Minute), rule, "") // 校准之后继续累计
+	s.advance(one(1600, 1800), t0.Add(2*time.Minute), rule, "") // 校准之后继续累计
 	if s.RX != 5100 || s.TX != 9100 {
 		t.Fatalf("must keep accumulating from the calibrated value: %+v", s)
 	}
@@ -657,17 +658,17 @@ func TestStateAdvanceIgnoresStaleSnapshot(t *testing.T) {
 	rule := resetRule{Day: 1}
 	s := &state{}
 	t0 := time.Date(2026, 10, 10, 12, 0, 0, 0, time.UTC)
-	s.advance(1_000_000_000, 500_000_000, t0, rule, "")
-	s.advance(1_000_001_000, 500_000_500, t0.Add(6*time.Second), rule, "") // 实时帧：较新的读数
-	s.advance(1_000_000_400, 500_000_200, t0.Add(time.Second), rule, "")   // HTTP 循环：几秒前采的读数
+	s.advance(one(1_000_000_000, 500_000_000), t0, rule, "")
+	s.advance(one(1_000_001_000, 500_000_500), t0.Add(6*time.Second), rule, "") // 实时帧：较新的读数
+	s.advance(one(1_000_000_400, 500_000_200), t0.Add(time.Second), rule, "")   // HTTP 循环：几秒前采的读数
 	if s.RX != 1000 || s.TX != 500 {
 		t.Fatalf("stale snapshot must be ignored, got RX=%d TX=%d", s.RX, s.TX)
 	}
-	s.advance(1_000_001_600, 500_000_900, t0.Add(8*time.Second), rule, "") // 之后的正常读数继续累计
+	s.advance(one(1_000_001_600, 500_000_900), t0.Add(8*time.Second), rule, "") // 之后的正常读数继续累计
 	if s.RX != 1600 || s.TX != 900 {
 		t.Fatalf("after stale: RX=%d TX=%d", s.RX, s.TX)
 	}
-	s.advance(100, 50, t0.Add(9*time.Second), rule, "") // 真正的计数器重置（读数是新的）仍按重置处理
+	s.advance(one(100, 50), t0.Add(9*time.Second), rule, "") // 真正的计数器重置（读数是新的）仍按重置处理
 	if s.RX != 1700 || s.TX != 950 {
 		t.Fatalf("real reset: RX=%d TX=%d", s.RX, s.TX)
 	}
@@ -693,8 +694,8 @@ func TestRestartKeepsMonthlyTraffic(t *testing.T) {
 		t.Fatalf("restored config: %+v", cfg)
 	}
 	t0 := time.Date(2026, 11, 6, 12, 0, 0, 0, time.UTC)
-	a := snapshot{at: t0, rx: 5000, tx: 6000}
-	b := snapshot{at: t0.Add(time.Second), rx: 5500, tx: 6300}
+	a := snapshot{at: t0, rx: 5000, tx: 6000, ifs: one(5000, 6000)}
+	b := snapshot{at: t0.Add(time.Second), rx: 5500, tx: 6300, ifs: one(5500, 6300)}
 	m := buildMetrics(a, b, cfg, st, map[string]any{}, map[string]any{})
 	if m["net_rx_monthly"] != uint64(1500) || m["net_tx_monthly"] != uint64(2300) {
 		t.Fatalf("monthly traffic must continue, got rx=%v tx=%v", m["net_rx_monthly"], m["net_tx_monthly"])
@@ -709,8 +710,8 @@ func TestUnsyncedConfigKeepsState(t *testing.T) {
 		t.Fatal("default config must not count as synced")
 	}
 	t0 := time.Date(2026, 11, 6, 12, 0, 0, 0, time.UTC)
-	a := snapshot{at: t0, rx: 5000, tx: 6000}
-	b := snapshot{at: t0.Add(time.Second), rx: 5500, tx: 6300}
+	a := snapshot{at: t0, rx: 5000, tx: 6000, ifs: one(5000, 6000)}
+	b := snapshot{at: t0.Add(time.Second), rx: 5500, tx: 6300, ifs: one(5500, 6300)}
 	m := buildMetrics(a, b, cfg, st, map[string]any{}, map[string]any{})
 	if m["net_rx_monthly"] != uint64(1000) || m["net_tx_monthly"] != uint64(2000) {
 		t.Fatalf("unsynced run must report stored totals, got rx=%v tx=%v", m["net_rx_monthly"], m["net_tx_monthly"])
@@ -749,5 +750,75 @@ func TestStateCfgPersisted(t *testing.T) {
 	}
 	if got := loadState(path).cachedCfg(); got != "report_interval=60&reset_day=5" {
 		t.Fatalf("cached config = %q", got)
+	}
+}
+
+// one 生成只有一块网卡的读数，给只关心合计值的测试用。
+func one(rx, tx uint64) map[string]ifCounters {
+	return map[string]ifCounters{"eth0": {RX: rx, TX: tx}}
+}
+
+// 网卡增减（虚拟机、容器、VPN 隧道起停）时，合计值会跳变，但累计流量只能按各网卡自己的增量算。
+func TestStateAdvancePerInterface(t *testing.T) {
+	rule := resetRule{Day: 1}
+	s := &state{}
+	t0 := time.Date(2026, 10, 10, 12, 0, 0, 0, time.UTC)
+	two := func(e, v uint64) map[string]ifCounters {
+		return map[string]ifCounters{"eth0": {RX: e, TX: e}, "vnet0": {RX: v, TX: v}}
+	}
+	s.advance(two(50_000_000_000, 1_000_000_000), t0, rule, "")
+	s.advance(two(50_000_001_000, 1_000_000_500), t0.Add(time.Minute), rule, "")
+	if s.RX != 1500 || s.TX != 1500 {
+		t.Fatalf("两块网卡各自累计: %+v", s)
+	}
+	// vnet0 消失：合计值从 51GB 变成 50GB，不能被当成计数器重置而把 50GB 加进当月流量
+	s.advance(one(50_000_002_000, 50_000_002_000), t0.Add(2*time.Minute), rule, "")
+	if s.RX != 2500 || s.TX != 2500 {
+		t.Fatalf("网卡消失不能产生假流量: RX=%d TX=%d", s.RX, s.TX)
+	}
+	// 新网卡出现：它从创建起的流量都是新增的
+	s.advance(two(50_000_003_000, 700), t0.Add(3*time.Minute), rule, "")
+	if s.RX != 4200 || s.TX != 4200 {
+		t.Fatalf("新网卡的流量要算进来: RX=%d TX=%d", s.RX, s.TX)
+	}
+	// 单块网卡的计数器被重置，仍按重置处理
+	s.advance(two(100, 800), t0.Add(4*time.Minute), rule, "")
+	if s.RX != 4200+100+100 || s.TX != 4200+100+100 {
+		t.Fatalf("单块网卡重置: RX=%d TX=%d", s.RX, s.TX)
+	}
+}
+
+// 读取 /proc/net/dev 失败得到空读数时必须忽略，不能把基线清成 0。
+func TestStateAdvanceIgnoresEmptyReading(t *testing.T) {
+	rule := resetRule{Day: 1}
+	s := &state{}
+	t0 := time.Date(2026, 10, 10, 12, 0, 0, 0, time.UTC)
+	s.advance(one(9_000_000_000, 9_000_000_000), t0, rule, "")
+	s.advance(nil, t0.Add(time.Minute), rule, "")
+	s.advance(one(9_000_000_100, 9_000_000_200), t0.Add(2*time.Minute), rule, "")
+	if s.RX != 100 || s.TX != 200 {
+		t.Fatalf("空读数不能破坏基线: RX=%d TX=%d", s.RX, s.TX)
+	}
+}
+
+// 旧版本的状态文件只有合计值：升级后的第一次累计按合计值算，不丢也不多算，之后自动带上每块网卡的读数。
+func TestStateAdvanceMigratesOldState(t *testing.T) {
+	rule := resetRule{Day: 1}
+	t0 := time.Date(2026, 10, 10, 12, 0, 0, 0, time.UTC)
+	s := &state{Period: "2026-10-01", RX: 1000, TX: 2000, LastRX: 5000, LastTX: 6000, Init: true}
+	s.advance(one(5400, 6300), t0, rule, "")
+	if s.RX != 1400 || s.TX != 2300 || len(s.Ifs) != 1 {
+		t.Fatalf("migration: %+v", s)
+	}
+	s.advance(one(5500, 6400), t0.Add(time.Minute), rule, "")
+	if s.RX != 1500 || s.TX != 2400 {
+		t.Fatalf("after migration: %+v", s)
+	}
+}
+
+func TestParseNetDevIfaces(t *testing.T) {
+	got := parseNetDevIfaces(netDevSample, map[string]bool{})
+	if len(got) != 2 || got["eth0"] != (ifCounters{RX: 1000, TX: 2000}) || got["ens3"] != (ifCounters{RX: 300, TX: 400}) {
+		t.Fatalf("auto: %+v", got)
 	}
 }

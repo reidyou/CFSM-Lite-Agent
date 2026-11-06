@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -292,5 +293,110 @@ func TestRealtimeSession(t *testing.T) {
 		}
 	case <-time.After(6 * time.Second):
 		t.Fatal("会话没有结束")
+	}
+}
+
+// blockingRWC 模拟对端网络卡死：写入一直阻塞，直到连接被关闭。
+type blockingRWC struct {
+	closed chan struct{}
+	once   sync.Once
+}
+
+func newBlockingRWC() *blockingRWC { return &blockingRWC{closed: make(chan struct{})} }
+
+func (b *blockingRWC) Read([]byte) (int, error) { <-b.closed; return 0, io.EOF }
+func (b *blockingRWC) Write([]byte) (int, error) {
+	<-b.closed
+	return 0, io.ErrClosedPipe
+}
+func (b *blockingRWC) Close() error { b.once.Do(func() { close(b.closed) }); return nil }
+
+// 写入卡住时，超时后底层连接被关闭，写入返回错误，而不是永远阻塞。
+func TestWSWriteTimeout(t *testing.T) {
+	old := wsWriteTimeout
+	wsWriteTimeout = 100 * time.Millisecond
+	defer func() { wsWriteTimeout = old }()
+	rwc := newBlockingRWC()
+	c := &wsConn{rwc: rwc, br: bufio.NewReader(rwc)}
+	done := make(chan error, 1)
+	go func() { done <- c.WriteText("ping") }()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("写入卡住时应该返回错误")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("写入没有在超时后返回")
+	}
+}
+
+// 对端卡死时 Close 也不能一直等：关闭帧写不出去，超过 wsCloseTimeout 就直接关闭连接。
+func TestWSCloseDoesNotHang(t *testing.T) {
+	old := wsCloseTimeout
+	wsCloseTimeout = 100 * time.Millisecond
+	defer func() { wsCloseTimeout = old }()
+	rwc := newBlockingRWC()
+	c := &wsConn{rwc: rwc, br: bufio.NewReader(rwc)}
+	done := make(chan struct{})
+	go func() { c.Close(); c.Close(); close(done) }() // 重复调用也要安全
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Close 卡住了")
+	}
+}
+
+// 收到任何帧（包括 ping）都会刷新「最近收到数据」的时间。
+func TestWSSinceRecv(t *testing.T) {
+	var in bytes.Buffer
+	in.Write(srvFrame(0x9, true, nil))
+	in.Write(srvFrame(0x1, true, []byte("x")))
+	rwc := &fakeRWC{Reader: &in, Writer: io.Discard}
+	c := &wsConn{rwc: rwc, br: bufio.NewReader(rwc)}
+	if c.sinceRecv() != 0 {
+		t.Fatal("还没收到数据时应返回 0")
+	}
+	if _, err := c.ReadText(); err != nil {
+		t.Fatal(err)
+	}
+	if d := c.sinceRecv(); d < 0 || d > time.Second {
+		t.Fatalf("sinceRecv = %v", d)
+	}
+}
+
+// 服务端握手之后一声不吭（半死连接）：Agent 必须自己发现并结束会话去重连，而不是一直等下去。
+func TestRealtimeSessionDetectsDeadConnection(t *testing.T) {
+	oldKA, oldDead := rtKeepalive, rtDeadAfter
+	rtKeepalive, rtDeadAfter = 100*time.Millisecond, 350*time.Millisecond
+	defer func() { rtKeepalive, rtDeadAfter = oldKA, oldDead }()
+
+	srv := wsTestServer(func(conn net.Conn, br *bufio.Reader) {
+		_, _ = conn.Write(srvFrame(0x1, true, []byte(`{"type":"ready","active":false,"interval":2}`)))
+		_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		for { // 只读不回：收到 ping 也不回 pong
+			if _, _, _, err := readClientFrame(br); err != nil {
+				return
+			}
+		}
+	})
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	errc := make(chan error, 1)
+	go func() {
+		errc <- realtimeSession(ctx, settings{URL: srv.URL, ID: "abc", Secret: "s3cret"}, newCfgBox(), &state{}, &sharedData{})
+	}()
+	select {
+	case err := <-errc:
+		var ce *closeError
+		if err == nil || errors.As(err, &ce) || ctx.Err() != nil {
+			t.Fatalf("应因没有收到任何数据而返回错误，得到: %v", err)
+		}
+		if !strings.Contains(err.Error(), "没有收到任何数据") {
+			t.Fatalf("错误信息: %v", err)
+		}
+	case <-time.After(4 * time.Second):
+		t.Fatal("死连接没有被发现")
 	}
 }

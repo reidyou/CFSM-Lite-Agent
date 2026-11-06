@@ -42,6 +42,7 @@ if [ "$ACTION" = uninstall ]; then
   systemctl disable --now cfsm-lite-agent >/dev/null 2>&1 || true
   rm -f "$UNIT" "$BIN"
   rm -rf "$ENV_DIR" /var/lib/private/cfsm-lite /var/lib/cfsm-lite
+  userdel cfsm-lite >/dev/null 2>&1 || true
   systemctl daemon-reload
   echo "已卸载 cfsm-lite-agent"
   exit 0
@@ -91,14 +92,34 @@ chmod 755 "$(dirname "$BIN")"
 install -m 0755 "$TMP/$NAME" "$BIN.new"
 mv -f "$BIN.new" "$BIN"
 
+# 状态文件放在程序同一目录（$ENV_DIR/state.json）。服务用专门的系统用户运行，只有这个目录归它所有；
+# 程序文件和 agent.env 仍归 root。写状态文件时要在同一目录里建临时文件再改名，所以目录必须可写。
+if ! id cfsm-lite >/dev/null 2>&1; then
+  command -v useradd >/dev/null 2>&1 || die "需要 useradd 命令来创建服务用户 cfsm-lite"
+  useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin cfsm-lite \
+    || die "创建服务用户 cfsm-lite 失败"
+fi
+
 umask 077
 mkdir -p "$ENV_DIR"
 chmod 755 "$ENV_DIR"
+chown cfsm-lite "$ENV_DIR"
+# 从旧版本的位置迁移状态文件，已累计的当月流量不丢（新位置已有文件时不覆盖）
+STATE="$ENV_DIR/state.json"
+if [ ! -f "$STATE" ]; then
+  for old in /var/lib/private/cfsm-lite/state.json /var/lib/cfsm-lite/state.json; do
+    if [ -f "$old" ]; then
+      cp "$old" "$STATE" && echo "已把旧状态文件迁移到 $STATE" || echo "警告: 迁移旧状态文件失败，当月流量将从安装时重新累计" >&2
+      break
+    fi
+  done
+fi
+[ ! -f "$STATE" ] || { chown cfsm-lite "$STATE"; chmod 600 "$STATE"; }
 cat > "$ENV_FILE" <<EOT
 CFSM_URL=$URL
 CFSM_ID=$ID
 CFSM_SECRET=$SECRET
-CFSM_STATE=/var/lib/cfsm-lite/state.json
+CFSM_STATE=$STATE
 EOT
 chmod 600 "$ENV_FILE"
 
@@ -113,8 +134,8 @@ EnvironmentFile=$ENV_FILE
 ExecStart=$BIN
 Restart=always
 RestartSec=10
-DynamicUser=yes
-StateDirectory=cfsm-lite
+User=cfsm-lite
+ReadWritePaths=$ENV_DIR
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=read-only

@@ -18,11 +18,14 @@ type state struct {
 	Iface  string `json:"iface"`   // 统计所用的网卡配置；变更后重新建立基线
 	RX     uint64 `json:"rx"`      // 本周期累计下行字节
 	TX     uint64 `json:"tx"`      // 本周期累计上行字节
-	LastRX uint64 `json:"last_rx"` // 上次读到的网卡原始累计值
+	LastRX uint64 `json:"last_rx"` // 上次读到的所有统计网卡的合计值
 	LastTX uint64 `json:"last_tx"`
-	Init   bool   `json:"init"`
-	CalID  string `json:"cal_id"` // 最近一次应用的手动校准编号，避免同一次校准重复应用
-	Cfg    string `json:"cfg"`    // 最近一次应用的服务端配置原文；重启后先用它，不用默认配置，否则重置日、时区、网卡不同的节点会被误清零
+	// 上次读到的每块网卡各自的累计值。增量按网卡分别算，网卡增减（虚拟机、容器、VPN 隧道起停）才不会算出巨大的假流量。
+	// 旧版本的状态文件里没有这一项，升级后的第一次累计仍按合计值算，之后自动带上。
+	Ifs   map[string]ifCounters `json:"ifs,omitempty"`
+	Init  bool                  `json:"init"`
+	CalID string                `json:"cal_id"` // 最近一次应用的手动校准编号，避免同一次校准重复应用
+	Cfg   string                `json:"cfg"`    // 最近一次应用的服务端配置原文；重启后先用它，不用默认配置，否则重置日、时区、网卡不同的节点会被误清零
 
 	lastAt time.Time // 上一次累计所用读数的采集时间（只在内存里，用来丢弃过期的读数）
 	dirty  bool      // 内存里有尚未写入文件的变化（只在内存里）
@@ -138,7 +141,17 @@ func (c config) rule() resetRule {
 // advance 用最新的网卡累计值更新当月累计流量。
 // now 是这组读数的采集时间。HTTP 上报循环采完读数后还要等 Ping 结束才会调用这里，期间实时推送协程可能已经用更新的读数累计过了；
 // 这时再用较早的读数，会被当成「计数器被重置」而把整个网卡累计值加进当月流量，所以比上次更早的读数直接丢弃。
-func (s *state) advance(rawRX, rawTX uint64, now time.Time, rule resetRule, iface string) {
+// ifs 是每块统计网卡各自的原始累计值；为空（读取 /proc/net/dev 失败）时直接忽略这次读数，
+// 否则会被当成「所有计数器归零」，下一次正常读数就会把整个累计值加进当月流量。
+func (s *state) advance(ifs map[string]ifCounters, now time.Time, rule resetRule, iface string) {
+	if len(ifs) == 0 {
+		return
+	}
+	var rawRX, rawTX uint64
+	for _, c := range ifs {
+		rawRX += c.RX
+		rawTX += c.TX
+	}
 	stMu.Lock()
 	defer stMu.Unlock()
 	if !s.lastAt.IsZero() && now.Before(s.lastAt) {
@@ -154,10 +167,27 @@ func (s *state) advance(rawRX, rawTX uint64, now time.Time, rule resetRule, ifac
 		s.RX, s.TX = 0, 0
 	}
 	if s.Init {
-		s.RX += delta(rawRX, s.LastRX)
-		s.TX += delta(rawTX, s.LastTX)
+		if s.Ifs != nil {
+			for name, c := range ifs {
+				if last, ok := s.Ifs[name]; ok {
+					s.RX += delta(c.RX, last.RX)
+					s.TX += delta(c.TX, last.TX)
+				} else { // 上次读数之后才出现的网卡：从创建起的流量都是新增的
+					s.RX += c.RX
+					s.TX += c.TX
+				}
+			}
+			// 上次有、这次没有的网卡直接忽略：它的流量已经累计过了，合计值变小不是流量减少
+		} else { // 旧版本的状态文件（只有合计值）：升级后的第一次仍按合计值算
+			s.RX += delta(rawRX, s.LastRX)
+			s.TX += delta(rawTX, s.LastTX)
+		}
 	}
 	s.LastRX, s.LastTX, s.Init = rawRX, rawTX, true
+	s.Ifs = make(map[string]ifCounters, len(ifs))
+	for name, c := range ifs {
+		s.Ifs[name] = c
+	}
 	s.dirty = true
 }
 
