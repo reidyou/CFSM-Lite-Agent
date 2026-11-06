@@ -257,7 +257,7 @@ func isDottedVersion(v string) bool {
 }
 
 // osDisplayName 生成要显示的系统名称。Debian 的 PRETTY_NAME 只有大版本（Debian GNU/Linux 13 (trixie)），
-// 小版本在 /etc/debian_version 里，所以 Debian 显示为「Debian 13.1 (trixie)」；
+// 小版本在 /etc/debian_version 里，所以 Debian 显示为「Debian 13.1」（不带代号）；
 // 其他发行版、或 debian_version 不是数字版本号时，仍用 PRETTY_NAME。
 func osDisplayName(osRelease, debianVersion string) string {
 	pretty := osPrettyName(osRelease)
@@ -268,11 +268,7 @@ func osDisplayName(osRelease, debianVersion string) string {
 	if !isDottedVersion(v) {
 		return pretty
 	}
-	name := "Debian " + v
-	if cn := osReleaseValue(osRelease, "VERSION_CODENAME"); cn != "" {
-		name += " (" + cn + ")"
-	}
-	return name
+	return "Debian " + v
 }
 
 func cpuModel(text string) string {

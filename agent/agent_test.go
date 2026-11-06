@@ -97,8 +97,8 @@ func TestOSAndCPU(t *testing.T) {
 	}
 	deb := "PRETTY_NAME=\"Debian GNU/Linux 13 (trixie)\"\nNAME=\"Debian GNU/Linux\"\nVERSION_ID=\"13\"\nVERSION_CODENAME=trixie\nID=debian\n"
 	for _, c := range []struct{ rel, ver, want string }{
-		{deb, "13.1\n", "Debian 13.1 (trixie)"},
-		{deb, "13.0", "Debian 13.0 (trixie)"},
+		{deb, "13.1\n", "Debian 13.1"},
+		{deb, "13.0", "Debian 13.0"},
 		// testing/sid：没有数字版本号，沿用 PRETTY_NAME
 		{deb, "trixie/sid\n", "Debian GNU/Linux 13 (trixie)"},
 		// 读不到 debian_version
