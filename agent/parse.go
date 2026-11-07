@@ -271,17 +271,46 @@ func osDisplayName(osRelease, debianVersion string) string {
 	return "Debian " + v
 }
 
+// cpuModel 取 CPU 型号。x86 的 /proc/cpuinfo 有 "model name"；ARM 开发板（Armbian、树莓派等）没有，
+// 依次退而求其次：Hardware（SoC 名）、Processor（32 位 ARM）、Model（开发板型号）。
 func cpuModel(text string) string {
+	want := []string{"model name", "hardware", "processor", "model"}
+	found := map[string]string{}
 	sc := bufio.NewScanner(strings.NewReader(text))
 	for sc.Scan() {
 		line := sc.Text()
-		if strings.HasPrefix(strings.ToLower(line), "model name") {
-			if i := strings.IndexByte(line, ':'); i >= 0 {
-				return strings.TrimSpace(line[i+1:])
-			}
+		i := strings.IndexByte(line, ':')
+		if i < 0 {
+			continue
+		}
+		key := strings.ToLower(strings.TrimSpace(line[:i]))
+		val := strings.TrimSpace(line[i+1:])
+		// "processor : 0" 是 x86 / arm64 里的核心编号，不是型号；32 位 ARM 的 "Processor : ARMv7 Processor rev 4 (v7l)" 才是
+		if key == "processor" && isAllDigits(val) {
+			continue
+		}
+		if _, ok := found[key]; !ok && val != "" {
+			found[key] = val
+		}
+	}
+	for _, k := range want {
+		if v, ok := found[k]; ok {
+			return v
 		}
 	}
 	return ""
+}
+
+func isAllDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // mountEntry 是 /proc/self/mounts 里的一行：设备、挂载点、文件系统类型。

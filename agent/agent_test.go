@@ -112,6 +112,17 @@ func TestOSAndCPU(t *testing.T) {
 	if got := cpuModel("processor : 0\nmodel name\t: Intel Xeon\n"); got != "Intel Xeon" {
 		t.Fatalf("cpu = %q", got)
 	}
+	// ARM 开发板（Armbian）：没有 model name，依次用 Hardware / Processor / Model；核心编号 "processor : 0" 不能当型号
+	for _, c := range []struct{ in, want string }{
+		{"processor\t: 0\nBogoMIPS\t: 48.00\nCPU part\t: 0xd08\n\nHardware\t: Rockchip RK3588\nModel\t\t: Orange Pi 5\n", "Rockchip RK3588"},
+		{"Processor\t: ARMv7 Processor rev 4 (v7l)\nprocessor\t: 0\n", "ARMv7 Processor rev 4 (v7l)"},
+		{"processor\t: 0\nModel\t\t: Raspberry Pi 4 Model B Rev 1.4\n", "Raspberry Pi 4 Model B Rev 1.4"},
+		{"processor\t: 0\nprocessor\t: 1\n", ""},
+	} {
+		if got := cpuModel(c.in); got != c.want {
+			t.Fatalf("cpuModel(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
 	if got := parseLoadavg("0.10 0.20 0.30 1/200 999\n"); got != "0.10 0.20 0.30" {
 		t.Fatalf("load = %q", got)
 	}

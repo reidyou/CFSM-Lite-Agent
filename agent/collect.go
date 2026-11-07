@@ -44,6 +44,9 @@ func loadStatic() staticInfo {
 			arch = "aarch64"
 		}
 		cpu := cpuModel(readFileString("/proc/cpuinfo"))
+		if cpu == "" { // ARM 开发板：设备树里有型号，例如 "Orange Pi 5"
+			cpu = strings.Trim(strings.TrimSpace(readFileString("/proc/device-tree/model")), "\x00")
+		}
 		if cpu == "" {
 			cpu = runtime.GOARCH + " CPU"
 		}

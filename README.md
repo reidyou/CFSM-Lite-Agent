@@ -54,11 +54,11 @@ Agent ──① 每个上报间隔 HTTP POST /update（带完整指标；响应�
 
 ## 2. 系统要求
 
-- Linux，CPU 架构 x86_64（amd64）或 arm64。
-- 使用 systemd（Debian、Ubuntu、CentOS、Rocky、Fedora 等常见发行版都是）。
-- 已安装 `curl`；安装时需要 root 权限。
+- Linux，CPU 架构 x86_64（amd64）、arm64，或 32 位 ARM（armv7l，例如 32 位的 Armbian 开发板）。
+- 使用 systemd（Debian、Ubuntu、Armbian、CentOS、Rocky、Fedora 等常见发行版都是），或 OpenRC（Alpine）。
+- 已安装 `curl`（Alpine 上缺少时脚本会自动用 `apk` 补装）；安装时需要 root 权限。
 - 服务器能访问你的 Worker 域名（HTTPS，443 端口）；安装时还要能访问 `github.com`（下载程序）。
-- **不支持** Windows、macOS、OpenWrt、Alpine（非 systemd）等系统。
+- **不支持** Windows、macOS、OpenWrt 等系统。
 - 服务器在中国大陆时，建议给 Worker 绑定自己的域名，不要用 `workers.dev`（见服务端 README）。
 
 ---
@@ -75,7 +75,7 @@ Agent ──① 每个上报间隔 HTTP POST /update（带完整指标；响应�
 
 ### 3.2 确认自动编译通过
 
-1. 打开仓库的 Actions 页，应该能看到名为 `ci` 的任务自动运行。它会做静态检查、运行单元测试，并对 amd64 和 arm64 各编译一次。
+1. 打开仓库的 Actions 页，应该能看到名为 `ci` 的任务自动运行。它会做静态检查、运行单元测试，并对 amd64、arm64 和 armv7 各编译一次。
 2. 变成绿色表示通过。**这也是代码第一次真正编译**，如果变红，点进去看日志，把报错原文发给我，不要继续往下做。
 
 ### 3.3 发布 Release
@@ -83,7 +83,7 @@ Agent ──① 每个上报间隔 HTTP POST /update（带完整指标；响应�
 1. 进入仓库的 Releases → Draft a new release。
 2. Tag 输入 `v1.0.0`，选择 Create new tag，标题随意，点 Publish release。
 3. 回到 Actions 页，等名为 `release` 的任务完成（约 1 到 2 分钟）。它会编译两个架构的程序，生成校验文件，并上传到这个 Release。
-4. 打开 Release 页面，应该能看到三个文件：`cfsm-lite-agent-linux-amd64`、`cfsm-lite-agent-linux-arm64`、`SHA256SUMS`。
+4. 打开 Release 页面，应该能看到四个文件：`cfsm-lite-agent-linux-amd64`、`cfsm-lite-agent-linux-arm64`、`cfsm-lite-agent-linux-armv7`、`SHA256SUMS`。
 
 ### 3.4 以后发布新版本
 
@@ -127,20 +127,20 @@ curl -fsSL https://raw.githubusercontent.com/用户名/CFSM-Lite-Agent/main/inst
 
 ### 4.4 脚本做了什么
 
-1. 检查是 root、系统有 systemd 和 curl、参数齐全、上报地址以 `https://` 开头。
+1. 检查是 root、服务管理器是 systemd 或 OpenRC（Alpine）、有 curl（Alpine 上缺少 `curl`、`ca-certificates` 时自动补装）、参数齐全、上报地址以 `https://` 开头。
 2. 根据 CPU 架构下载对应的程序，同时下载 `SHA256SUMS` 校验文件并核对；校验失败就中止（拿不到校验文件时会提示警告并继续）。
 3. 把程序放到 `/opt/cfsm-lite/cfsm-lite-agent`。
 4. 把上报地址、节点 ID、密钥写入 `/opt/cfsm-lite/agent.env`，文件权限 600，只有 root 能读。
-5. 创建 systemd 服务 `cfsm-lite-agent` 并启动。服务以专门创建的低权限系统用户 `cfsm-lite` 运行（只能写 `/opt/cfsm-lite` 这一个目录），并开启这些保护：`ReadWritePaths` 只开放该目录、`NoNewPrivileges`、`ProtectSystem=strict`、`ProtectHome=read-only`、`PrivateTmp`、不授予任何额外权限（`CapabilityBoundingSet` 为空）。`ProtectHome` 用只读而不是完全隐藏，是为了让单独挂载在 `/home` 的磁盘也能被统计到。
+5. 创建服务 `cfsm-lite-agent` 并启动：systemd 系统是 `/etc/systemd/system/cfsm-lite-agent.service`；Alpine 是 OpenRC 脚本 `/etc/init.d/cfsm-lite-agent`（用 supervise-daemon 守护，异常退出 10 秒后重启，日志写到 `/var/log/cfsm-lite-agent.log`，超过 5MB 时在下次启动时清空；Alpine 上无法使用下面 systemd 的沙箱保护项）。两种系统的程序、`agent.env`、`state.json` 路径完全相同，创建的服务用户也都是 `cfsm-lite`。下面的描述以 systemd 为准：服务以专门创建的低权限系统用户 `cfsm-lite` 运行（只能写 `/opt/cfsm-lite` 这一个目录），并开启这些保护：`ReadWritePaths` 只开放该目录、`NoNewPrivileges`、`ProtectSystem=strict`、`ProtectHome=read-only`、`PrivateTmp`、不授予任何额外权限（`CapabilityBoundingSet` 为空）。`ProtectHome` 用只读而不是完全隐藏，是为了让单独挂载在 `/home` 的磁盘也能被统计到。
 6. 当月流量的累计状态保存在 `/opt/cfsm-lite/state.json`（和程序在同一目录；服务以专门的系统用户 `cfsm-lite` 运行，只有这个目录归它所有，程序和 `agent.env` 仍归 root；从旧版本升级时，安装脚本会把旧位置的状态文件迁移过来）。同一个文件里还保存着最近一次从 Worker 收到的配置（重置日、重置时刻、时区、统计网卡等），所以重启服务或重新执行安装命令升级后，Agent 会先按这份配置接着累计，不会因为尚未连上 Worker 而用默认值把当月流量清零。
 
 ### 4.5 日常管理
 
 | 想做的事 | 命令 |
 |---|---|
-| 查看运行日志 | `journalctl -u cfsm-lite-agent -f` |
-| 查看服务状态 | `systemctl status cfsm-lite-agent` |
-| 重启 | `systemctl restart cfsm-lite-agent` |
+| 查看运行日志 | `journalctl -u cfsm-lite-agent -f`（Alpine：`tail -f /var/log/cfsm-lite-agent.log`） |
+| 查看服务状态 | `systemctl status cfsm-lite-agent`（Alpine：`rc-service cfsm-lite-agent status`） |
+| 重启 | `systemctl restart cfsm-lite-agent`（Alpine：`rc-service cfsm-lite-agent restart`） |
 | 升级 | 发布新 Release 后，重新执行同一条安装命令（节点 ID 和流量累计不受影响） |
 | 安装指定版本 | 在安装命令的 `sh -s --` 后面加 `-v v1.0.1` |
 | 卸载 | 把安装命令里 `sh -s --` 后面的内容换成 `--uninstall` |
@@ -274,7 +274,7 @@ Agent 本地只有三项必需配置：上报地址、节点 ID、上报密钥�
 
 ## 9. 常见问题与排错
 
-先看日志：`journalctl -u cfsm-lite-agent -n 50`。
+先看日志：`journalctl -u cfsm-lite-agent -n 50`（Alpine：`tail -n 50 /var/log/cfsm-lite-agent.log`）。
 
 | 日志里的内容 | 含义和处理 |
 |---|---|
@@ -306,7 +306,7 @@ Agent 本地只有三项必需配置：上报地址、节点 ID、上报密钥�
 
 ### 10.2 已知限制
 
-- 只支持 Linux（amd64 和 arm64）和 systemd。
+- 只支持 Linux（amd64、arm64 和 armv7）以及 systemd 或 OpenRC。
 - 不支持 ICMP 探测，只有 TCP。
 - 不保存历史数据，也没有历史曲线。
 - 自己的实时推送协议和原版 CF-Server-Monitor 的 cfsm-agent **不通用**；原版 Agent 不能连接本项目的实时通道。
@@ -344,3 +344,9 @@ CFSM-Lite-Agent/
 - **`install.sh` 在服务端 CFSM-Lite 仓库的 `src/index.js` 里还有一份拷贝**（常量 `INSTALL_SH`），修改本仓库的 `install.sh` 后，要把同样的内容同步过去。脚本里 `REPO="__REPO__"` 这一行是占位符，保持不变：服务端返回脚本时会把它替换成 `AGENT_REPO` 的值，直接使用本仓库脚本时则读取环境变量 `CFSM_AGENT_REPO`。
 - 本地开发（可选，需要 Go 1.21 或更新版本）：`go vet ./...`、`go test ./...`。
 - 程序的版本号在编译时由 `release.yml` 注入（等于 Release 的 Tag）；本地直接编译得到的版本号是 `dev`。
+
+## 11. Alpine 与 Armbian 说明
+
+- **静态编译**：所有 Release 文件都用 `CGO_ENABLED=0` 编译，不依赖 glibc，Alpine（musl）直接能运行；时区数据库也编进了程序（`time/tzdata`），Alpine 没装 `tzdata` 也不影响。新增依赖时不要引入需要 CGO 的库，否则 Alpine 上会出现 `not found`。安装脚本会在启动服务前试运行一次下载的程序，无法执行时（退出码 126 / 127）直接中止并提示。
+- **Armbian**：64 位用 arm64 版本，32 位（`uname -m` 为 `armv7l`）用 armv7 版本。ARM 的 `/proc/cpuinfo` 没有 `model name`，CPU 型号依次取 `Hardware`、`Processor`、`Model`，都没有时读设备树 `/proc/device-tree/model`（例如 `Orange Pi 5`）。
+- **本机检查**：`GOOS=linux GOARCH=arm GOARM=7 CGO_ENABLED=0 go build -o /dev/null .`；在 Alpine 容器里跑：`docker run --rm -v "$PWD:/d" alpine:3 /d/cfsm-lite-agent-linux-amd64`，出现 `not found` 说明不是静态编译，程序因为缺少配置而退出则说明二进制没问题。

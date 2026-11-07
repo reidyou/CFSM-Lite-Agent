@@ -8,6 +8,7 @@
 #   curl -fsSL https://raw.githubusercontent.com/用户名/CFSM-Lite-Agent/main/install.sh | CFSM_AGENT_REPO=用户名/CFSM-Lite-Agent sh -s -- -i 节点ID -s 上报密钥 -u https://你的域名/update
 #
 # 卸载：在上面任意一条命令的 sh -s -- 后面改成 --uninstall
+# 支持 systemd（Debian、Ubuntu、Armbian 等）和 OpenRC（Alpine）。Alpine 会自动补装 curl、ca-certificates、tzdata。
 # 指定版本：加参数 -v v1.0.0（默认安装最新的 Release）
 set -eu
 
@@ -16,6 +17,8 @@ BIN=/opt/cfsm-lite/cfsm-lite-agent
 ENV_DIR=/opt/cfsm-lite
 ENV_FILE=/opt/cfsm-lite/agent.env
 UNIT=/etc/systemd/system/cfsm-lite-agent.service
+RC_FILE=/etc/init.d/cfsm-lite-agent
+RC_LOG=/var/log/cfsm-lite-agent.log
 
 die() { echo "错误: $*" >&2; exit 1; }
 
@@ -36,17 +39,35 @@ while [ $# -gt 0 ]; do
 done
 
 [ "$(id -u)" -eq 0 ] || die "需要 root 权限：请用 root 执行，或在 sh 前面加 sudo"
-command -v systemctl >/dev/null 2>&1 || die "只支持使用 systemd 的 Linux 系统"
+
+# 识别发行版和服务管理器：systemd（Debian、Ubuntu、Armbian、CentOS 等）或 OpenRC（Alpine）
+DISTRO=linux
+if [ -f /etc/alpine-release ]; then DISTRO=alpine
+elif [ -f /etc/armbian-release ]; then DISTRO=armbian
+fi
+INIT=""
+if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then INIT=systemd
+elif command -v rc-service >/dev/null 2>&1 && command -v rc-update >/dev/null 2>&1; then INIT=openrc
+fi
 
 if [ "$ACTION" = uninstall ]; then
-  systemctl disable --now cfsm-lite-agent >/dev/null 2>&1 || true
-  rm -f "$UNIT" "$BIN"
+  # 不管当初装的是哪种服务，两种都清理
+  if command -v systemctl >/dev/null 2>&1; then systemctl disable --now cfsm-lite-agent >/dev/null 2>&1 || true; fi
+  if [ -f "$RC_FILE" ] && command -v rc-service >/dev/null 2>&1; then
+    rc-service cfsm-lite-agent stop >/dev/null 2>&1 || true
+    rc-update del cfsm-lite-agent default >/dev/null 2>&1 || true
+  fi
+  rm -f "$UNIT" "$RC_FILE" "$RC_LOG" "$BIN"
   rm -rf "$ENV_DIR" /var/lib/private/cfsm-lite /var/lib/cfsm-lite
-  userdel cfsm-lite >/dev/null 2>&1 || true
-  systemctl daemon-reload
+  if command -v userdel >/dev/null 2>&1; then userdel cfsm-lite >/dev/null 2>&1 || true
+  elif command -v deluser >/dev/null 2>&1; then deluser cfsm-lite >/dev/null 2>&1 || true
+  fi
+  if command -v systemctl >/dev/null 2>&1; then systemctl daemon-reload >/dev/null 2>&1 || true; fi
   echo "已卸载 cfsm-lite-agent"
   exit 0
 fi
+
+[ -n "$INIT" ] || die "只支持使用 systemd 或 OpenRC 的 Linux 系统（Debian、Ubuntu、Armbian、Alpine 等）"
 
 case "$REPO" in
   __*) REPO="$(printenv CFSM_AGENT_REPO || true)" ;; # 没有被 Worker 填好：改用环境变量
@@ -58,6 +79,18 @@ case "$REPO" in
 esac
 case "$REPO" in *[!A-Za-z0-9_./-]*) die "发布仓库里含有不支持的字符" ;; esac
 
+# Alpine 默认没有 curl、CA 证书和时区数据库：缺什么补什么（Agent 访问 https 和换算时区都要用到）
+if [ "$DISTRO" = alpine ] && command -v apk >/dev/null 2>&1; then
+  NEED=""
+  command -v curl >/dev/null 2>&1 || NEED="$NEED curl"
+  [ -f /etc/ssl/certs/ca-certificates.crt ] || NEED="$NEED ca-certificates"
+  [ -d /usr/share/zoneinfo ] || NEED="$NEED tzdata"
+  if [ -n "$NEED" ]; then
+    echo "安装依赖:$NEED"
+    # shellcheck disable=SC2086
+    apk add --no-cache $NEED >/dev/null || die "安装依赖失败:$NEED"
+  fi
+fi
 command -v curl >/dev/null 2>&1 || die "需要先安装 curl"
 [ -n "$ID" ] && [ -n "$SECRET" ] && [ -n "$URL" ] || die "缺少参数：-i 节点ID  -s 上报密钥  -u 上报地址"
 case "$URL" in https://*) ;; *) die "上报地址必须以 https:// 开头" ;; esac
@@ -66,7 +99,8 @@ case "$ID$SECRET$URL" in *[!A-Za-z0-9._:+/=?@-]*) die "节点 ID、密钥或地�
 case "$(uname -m)" in
   x86_64|amd64) ARCH=amd64 ;;
   aarch64|arm64) ARCH=arm64 ;;
-  *) die "不支持的 CPU 架构: $(uname -m)（只支持 x86_64 和 arm64）" ;;
+  armv7l|armv8l|armhf) ARCH=armv7 ;; # 32 位的 Armbian 开发板（需要 Agent 仓库发布 armv7 版本）
+  *) die "不支持的 CPU 架构: $(uname -m)（支持 x86_64、arm64 和 armv7）" ;;
 esac
 
 if [ "$TAG" = latest ]; then
@@ -79,9 +113,10 @@ NAME="cfsm-lite-agent-linux-$ARCH"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 echo "下载 $NAME ..."
-curl -fsSL "$BASE/$NAME" -o "$TMP/$NAME" || die "下载失败: $BASE/$NAME（请确认仓库 $REPO 已发布 Release）"
+curl -fsSL "$BASE/$NAME" -o "$TMP/$NAME" || die "下载失败: $BASE/$NAME（请确认仓库 $REPO 已发布 Release，并且包含 $ARCH 版本）"
+GOT="$NAME"
 if command -v sha256sum >/dev/null 2>&1 && curl -fsSL "$BASE/SHA256SUMS" -o "$TMP/SHA256SUMS" 2>/dev/null; then
-  (cd "$TMP" && grep " $NAME\$" SHA256SUMS | sha256sum -c - >/dev/null) || die "文件校验失败，可能下载损坏或被篡改，已中止"
+  (cd "$TMP" && grep " $GOT\$" SHA256SUMS | sha256sum -c - >/dev/null) || die "文件校验失败，可能下载损坏或被篡改，已中止"
   echo "校验通过"
 else
   echo "警告: 无法校验文件完整性（缺少 sha256sum 或 SHA256SUMS）" >&2
@@ -89,15 +124,33 @@ fi
 
 mkdir -p "$(dirname "$BIN")"
 chmod 755 "$(dirname "$BIN")"
-install -m 0755 "$TMP/$NAME" "$BIN.new"
+install -m 0755 "$TMP/$GOT" "$BIN.new"
+# 先确认二进制能在本机运行：Agent 是静态编译的，Alpine（musl）可以直接用；万一装了动态链接 glibc 的程序时，执行会直接失败（退出码 126 / 127）。
+# 空环境里最多跑 3 秒：程序配置不全会自己退出，超时被杀（124）或正常退出都算通过，只有「无法执行」才中止。
+if command -v timeout >/dev/null 2>&1; then
+  RC=0
+  env -i CFSM_STATE=/nonexistent/state.json timeout 3 "$BIN.new" >/dev/null 2>&1 || RC=$?
+  if [ "$RC" -eq 126 ] || [ "$RC" -eq 127 ]; then
+    rm -f "$BIN.new"
+    die "下载的程序无法在本机运行（退出码 $RC）。Alpine 等 musl 系统需要静态编译的 Agent（CGO_ENABLED=0）"
+  fi
+fi
 mv -f "$BIN.new" "$BIN"
 
 # 状态文件放在程序同一目录（$ENV_DIR/state.json）。服务用专门的系统用户运行，只有这个目录归它所有；
 # 程序文件和 agent.env 仍归 root。写状态文件时要在同一目录里建临时文件再改名，所以目录必须可写。
 if ! id cfsm-lite >/dev/null 2>&1; then
-  command -v useradd >/dev/null 2>&1 || die "需要 useradd 命令来创建服务用户 cfsm-lite"
-  useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin cfsm-lite \
-    || die "创建服务用户 cfsm-lite 失败"
+  NOLOGIN=/bin/false
+  for sh in /usr/sbin/nologin /sbin/nologin; do [ -x "$sh" ] && { NOLOGIN="$sh"; break; }; done
+  if command -v useradd >/dev/null 2>&1; then
+    useradd --system --no-create-home --home-dir /nonexistent --shell "$NOLOGIN" cfsm-lite \
+      || die "创建服务用户 cfsm-lite 失败"
+  elif command -v adduser >/dev/null 2>&1; then # Alpine（BusyBox）
+    adduser -S -D -H -h /nonexistent -s "$NOLOGIN" cfsm-lite \
+      || die "创建服务用户 cfsm-lite 失败"
+  else
+    die "需要 useradd 或 adduser 命令来创建服务用户 cfsm-lite"
+  fi
 fi
 
 umask 077
@@ -123,7 +176,8 @@ CFSM_STATE=$STATE
 EOT
 chmod 600 "$ENV_FILE"
 
-cat > "$UNIT" <<EOT
+if [ "$INIT" = systemd ]; then
+  cat > "$UNIT" <<EOT
 [Unit]
 Description=CFSM Lite Agent
 After=network-online.target
@@ -145,15 +199,53 @@ CapabilityBoundingSet=
 [Install]
 WantedBy=multi-user.target
 EOT
-chmod 644 "$UNIT"
+  chmod 644 "$UNIT"
 
-systemctl daemon-reload
-systemctl enable cfsm-lite-agent >/dev/null 2>&1
-systemctl restart cfsm-lite-agent
-sleep 3
-if systemctl is-active --quiet cfsm-lite-agent; then
-  echo "安装完成。查看运行日志: journalctl -u cfsm-lite-agent -f"
+  systemctl daemon-reload
+  systemctl enable cfsm-lite-agent >/dev/null 2>&1
+  systemctl restart cfsm-lite-agent
+  sleep 3
+  if systemctl is-active --quiet cfsm-lite-agent; then
+    echo "安装完成。查看运行日志: journalctl -u cfsm-lite-agent -f"
+  else
+    echo "服务没有正常启动，请查看日志: journalctl -u cfsm-lite-agent -n 50" >&2
+    exit 1
+  fi
 else
-  echo "服务没有正常启动，请查看日志: journalctl -u cfsm-lite-agent -n 50" >&2
-  exit 1
+  # OpenRC（Alpine）：用 supervise-daemon 守护，异常退出 10 秒后自动重启，和 systemd 的 Restart=always 一致
+  cat > "$RC_FILE" <<EOT
+#!/sbin/openrc-run
+name="cfsm-lite-agent"
+description="CFSM Lite Agent"
+command="$BIN"
+command_user="cfsm-lite"
+supervisor="supervise-daemon"
+respawn_delay=10
+respawn_max=0
+output_log="$RC_LOG"
+error_log="$RC_LOG"
+
+depend() {
+	need net
+	after firewall
+}
+
+start_pre() {
+	# 日志超过 5MB 就清空，避免占满小容量的 Alpine 磁盘
+	if [ -f "\$output_log" ] && [ "\$(wc -c < "\$output_log")" -gt 5242880 ]; then : > "\$output_log"; fi
+	set -a
+	. "$ENV_FILE"
+	set +a
+}
+EOT
+  chmod 755 "$RC_FILE"
+  rc-update add cfsm-lite-agent default >/dev/null 2>&1 || true
+  rc-service cfsm-lite-agent restart >/dev/null 2>&1 || rc-service cfsm-lite-agent start >/dev/null 2>&1 || true
+  sleep 3
+  if rc-service cfsm-lite-agent status >/dev/null 2>&1; then
+    echo "安装完成。查看运行日志: tail -f $RC_LOG"
+  else
+    echo "服务没有正常启动，请查看日志: tail -n 50 $RC_LOG" >&2
+    exit 1
+  fi
 fi
