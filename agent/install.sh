@@ -231,6 +231,9 @@ depend() {
 }
 
 start_pre() {
+	# supervise-daemon 会先切换到 command_user，再打开日志文件；/var/log 只有 root 能写，
+	# 日志文件必须事先建好并归 cfsm-lite 所有，否则子进程每次都在打开日志时退出，服务显示 started 却没有任何输出和上报
+	checkpath -f -o cfsm-lite -m 0640 "\$output_log" || return 1
 	# 日志超过 5MB 就清空，避免占满小容量的 Alpine 磁盘
 	if [ -f "\$output_log" ] && [ "\$(wc -c < "\$output_log")" -gt 5242880 ]; then : > "\$output_log"; fi
 	set -a
@@ -239,6 +242,10 @@ start_pre() {
 }
 EOT
   chmod 755 "$RC_FILE"
+  # 提前建好日志文件并交给服务用户（start_pre 里的 checkpath 会再保证一次，日志被删除后也能自动重建）
+  : >> "$RC_LOG"
+  chown cfsm-lite "$RC_LOG"
+  chmod 640 "$RC_LOG"
   rc-update add cfsm-lite-agent default >/dev/null 2>&1 || true
   rc-service cfsm-lite-agent restart >/dev/null 2>&1 || rc-service cfsm-lite-agent start >/dev/null 2>&1 || true
   sleep 3
