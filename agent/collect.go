@@ -113,8 +113,8 @@ func reachable(network, addr string) string {
 	return "1"
 }
 
-// diskTotals 统计本机所有磁盘的总容量和已用量（MB）：只算本地块设备，网络挂载和虚拟文件系统不计入，
-// 同一块设备被挂载多次只算一次。如果一个都没识别出来（例如某些容器环境），退回到只统计根目录。
+// diskTotals 统计本机所有磁盘的总容量和已用量（MB）：算本地块设备和 ZFS 存储池，根目录始终算上，
+// 网络挂载和虚拟文件系统不计入，同一块磁盘被挂载多次只算一次。如果一个都没识别出来，退回到只统计根目录。
 func diskTotals() (totalMB, usedMB int64) {
 	mounts := selectDiskMounts(parseMounts(readFileString("/proc/self/mounts")))
 	totalMB, usedMB = sumDisks(mounts, statfsBytes)

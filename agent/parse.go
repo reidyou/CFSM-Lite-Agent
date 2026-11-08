@@ -394,31 +394,75 @@ func isLocalDiskMount(m mountEntry) bool {
 	return true
 }
 
-// selectDiskMounts 挑出要统计的挂载点。同一个设备可能被挂载多次（bind 挂载、btrfs 子卷、systemd 的只读保护），
-// 只取第一次出现的，避免重复累加。
+// isZFSMount 判断是不是 ZFS 数据集的挂载（设备名是「存储池/数据集」，不在 /dev/ 下）。
+func isZFSMount(m mountEntry) bool {
+	return m.FSType == "zfs" && m.Device != "" && !strings.HasPrefix(m.Device, "/")
+}
+
+// diskKey 是「同一块磁盘」的标识，用来去重：ZFS 的多个数据集共用一个存储池，按池名（设备名里第一个 / 之前的部分）算一块；
+// 其他文件系统按设备算（bind 挂载、btrfs 子卷、systemd 的只读保护会让同一个设备出现多次）。
+func diskKey(m mountEntry) string {
+	if m.FSType == "zfs" {
+		if i := strings.IndexByte(m.Device, '/'); i > 0 {
+			return "zfs:" + m.Device[:i]
+		}
+		return "zfs:" + m.Device
+	}
+	return m.Device
+}
+
+// selectDiskMounts 挑出要统计的挂载点：
+//   - 本机块设备（见 isLocalDiskMount）和 ZFS 数据集；
+//   - 根目录 / 始终算上（和 Komari 一致）：LXC 等容器的根文件系统可能是 loop 设备、ZFS 子卷甚至 overlay，不在上面的规则里，
+//     不算的话磁盘会显示成 0。旧内核的 /proc/self/mounts 里可能先出现一行 rootfs 再出现真正的根，所以只取最后一个 /；
+//   - 同一个设备被挂载多次只取第一次出现的，避免重复累加。ZFS 的数据集全部保留，由 sumDisks 按存储池取容量最大的那个。
 func selectDiskMounts(entries []mountEntry) []mountEntry {
+	lastRoot := -1
+	for i, m := range entries {
+		if m.Point == "/" {
+			lastRoot = i
+		}
+	}
 	seen := map[string]bool{}
 	var out []mountEntry
-	for _, m := range entries {
-		if !isLocalDiskMount(m) || seen[m.Device] {
+	for i, m := range entries {
+		if m.Point == "/" && i != lastRoot {
 			continue
 		}
-		seen[m.Device] = true
+		if !(isLocalDiskMount(m) || isZFSMount(m) || i == lastRoot) {
+			continue
+		}
+		if m.FSType != "zfs" {
+			k := diskKey(m)
+			if seen[k] {
+				continue
+			}
+			seen[k] = true
+		}
 		out = append(out, m)
 	}
 	return out
 }
 
-// sumDisks 把各个挂载点的容量和已用量累加，返回 MB。stat 返回字节数。
+// sumDisks 把各块磁盘的容量和已用量累加，返回 MB。stat 返回字节数。
+// 同一块磁盘（见 diskKey）出现多次时只算容量最大的那一个，和 Komari 一致：ZFS 一个存储池下的多个数据集就只算一份，不会重复累加。
 func sumDisks(mounts []mountEntry, stat func(path string) (total, used uint64, ok bool)) (totalMB, usedMB int64) {
-	var t, u uint64
+	type usage struct{ total, used uint64 }
+	best := map[string]usage{}
 	for _, m := range mounts {
 		tt, uu, ok := stat(m.Point)
 		if !ok {
 			continue
 		}
-		t += tt
-		u += uu
+		k := diskKey(m)
+		if cur, seen := best[k]; !seen || tt > cur.total {
+			best[k] = usage{tt, uu}
+		}
+	}
+	var t, u uint64
+	for _, v := range best {
+		t += v.total
+		u += v.used
 	}
 	return int64(t >> 20), int64(u >> 20)
 }

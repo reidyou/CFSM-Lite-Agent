@@ -571,6 +571,65 @@ func TestSumDisks(t *testing.T) {
 	}
 }
 
+// ZFS：同一个存储池下的多个数据集只算一份（取容量最大的那个，和 Komari 一致），不同存储池各算各的。
+func TestSelectAndSumDisksZFS(t *testing.T) {
+	const sample = `rpool/ROOT/ubuntu_abc / zfs rw,relatime,xattr 0 0
+rpool/USERDATA/home_x /home zfs rw 0 0
+bpool/BOOT/ubuntu_abc /boot zfs rw 0 0
+tank /tank zfs rw 0 0
+tank/media /tank/media zfs rw 0 0
+tmpfs /run tmpfs rw 0 0
+`
+	got := selectDiskMounts(parseMounts(sample))
+	var pts []string
+	for _, m := range got {
+		pts = append(pts, m.Point)
+	}
+	if want := "/,/home,/boot,/tank,/tank/media"; strings.Join(pts, ",") != want {
+		t.Fatalf("selected mount points = %v, want %s", pts, want)
+	}
+	sizes := map[string][2]uint64{
+		"/":           {50 << 30, 10 << 30},
+		"/home":       {60 << 30, 20 << 30},
+		"/boot":       {2 << 30, 1 << 30},
+		"/tank":       {1000 << 30, 400 << 30},
+		"/tank/media": {900 << 30, 300 << 30},
+	}
+	stat := func(path string) (uint64, uint64, bool) {
+		v, ok := sizes[path]
+		return v[0], v[1], ok
+	}
+	total, used := sumDisks(got, stat)
+	// rpool 取 /home（60GB），bpool 是 2GB，tank 取 /tank（1000GB）
+	if total != (60+2+1000)*1024 || used != (20+1+400)*1024 {
+		t.Fatalf("total=%d used=%d", total, used)
+	}
+}
+
+// 根目录始终统计：LXC 的根可能是 loop 设备、ZFS 子卷或 overlay；旧内核会先出现一行 rootfs，只取最后一个 /。
+func TestSelectDiskMountsRootAlwaysIncluded(t *testing.T) {
+	cases := []struct {
+		name, sample, dev string
+		n                 int
+	}{
+		{"loop 根", "/dev/loop0 / ext4 rw 0 0\n/dev/sda1 /data ext4 rw 0 0\n", "/dev/loop0", 2},
+		{"ZFS 子卷", "rpool/data/subvol-100-disk-0 / zfs rw 0 0\n", "rpool/data/subvol-100-disk-0", 1},
+		{"overlay 根", "overlay / overlay rw 0 0\ntmpfs /run tmpfs rw 0 0\n", "overlay", 1},
+		{"旧内核的 rootfs", "rootfs / rootfs rw 0 0\n/dev/root / ext4 rw 0 0\n", "/dev/root", 1},
+	}
+	for _, c := range cases {
+		got := selectDiskMounts(parseMounts(c.sample))
+		if len(got) != c.n || got[0].Point != "/" || got[0].Device != c.dev {
+			t.Errorf("%s: got %+v", c.name, got)
+		}
+	}
+	// 根目录所在设备又挂在别处时不重复统计
+	got := selectDiskMounts(parseMounts("/dev/sda1 /mnt/x ext4 rw 0 0\n/dev/sda1 / ext4 rw 0 0\n"))
+	if len(got) != 1 {
+		t.Errorf("同一设备应只统计一次: %+v", got)
+	}
+}
+
 func TestPeriodKeyResetTime(t *testing.T) {
 	sh, err := time.LoadLocation("Asia/Shanghai")
 	if err != nil {
