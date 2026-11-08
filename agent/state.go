@@ -119,12 +119,14 @@ func saveLoop(ctx context.Context, s *state, path string, every time.Duration) {
 	}
 }
 
-// delta 计算两次读数之间的增量；当前值小于上次说明计数器被重置（重启、网卡重建），此时整个当前值都是新增量。
+// delta 计算两次读数之间的增量。当前值小于上次说明计数器被重置（重启、网卡重建）或读数异常，这一段按 0 处理、只重建基线，
+// 和 Komari Agent 的 safeDelta 一致。曾经把「整个当前值」当作新增量，计数器每被重置一次（尤其是网卡重建、读数抖动）就会凭空多出
+// 一整个计数器的流量，这是当月流量偏大的主要来源。代价只是丢掉重置到下一次读数之间的那一小段真实流量，宁可略少、不能虚高。
 func delta(cur, last uint64) uint64 {
 	if cur >= last {
 		return cur - last
 	}
-	return cur
+	return 0
 }
 
 // resetRule 描述流量何时重置：每月 Day 日的 Hour:Minute（按 Loc 时区）；Day 为 0 表示不重置。
@@ -172,10 +174,9 @@ func (s *state) advance(ifs map[string]ifCounters, now time.Time, rule resetRule
 				if last, ok := s.Ifs[name]; ok {
 					s.RX += delta(c.RX, last.RX)
 					s.TX += delta(c.TX, last.TX)
-				} else { // 上次读数之后才出现的网卡：从创建起的流量都是新增的
-					s.RX += c.RX
-					s.TX += c.TX
 				}
+				// 上次读数之后才出现的网卡（含读数抖动后重新出现的）：这次只记下基线，不把它的累计值当作新增流量，
+				// 和 Komari Agent 一致（lastCounters 里没有的网卡首次采样不记录）。
 			}
 			// 上次有、这次没有的网卡直接忽略：它的流量已经累计过了，合计值变小不是流量减少
 		} else { // 旧版本的状态文件（只有合计值）：升级后的第一次仍按合计值算

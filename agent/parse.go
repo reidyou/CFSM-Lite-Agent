@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"math"
+	"path/filepath"
 	"strconv"
 	"strings"
 )
@@ -116,13 +117,33 @@ func parseMeminfo(text string) memInfo {
 	}
 }
 
+// excludedIfacePrefixes 是自动汇总时不计入流量的网卡名前缀，和 Komari Agent 的 loopbackNames 保持一致：
+// 这些网卡（回环、容器、虚拟网桥、虚拟机的 tap 口等）上的流量，要么本来就会从物理网卡再走一遍（算进去就是重复计数，
+// 例如 Proxmox 的 vmbr0 + 物理网卡、KVM 的 br0 + vnet/tap），要么根本不出本机。
+// 前缀匹配，所以 "br" 会同时排除 br0、br-xxxx、bridge0。kube、cali 是本项目额外保留的（Kubernetes 的虚拟网卡，同样会重复计数）。
+var excludedIfacePrefixes = []string{
+	"lo", "br", "cni", "docker", "podman", "flannel", "veth", "virbr", "vmbr", "tap", "fwbr", "fwpr",
+	"kube", "cali",
+}
+
 // ifaceExcluded 判断网卡是否属于回环或容器、虚拟网桥（自动汇总时不计入流量）。
 func ifaceExcluded(name string) bool {
-	if name == "lo" {
+	for _, p := range excludedIfacePrefixes {
+		if strings.HasPrefix(name, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// ifaceSelected 判断网卡是否在「统计网卡」白名单里；白名单支持 * ? 通配符（和 Komari 一致），例如 "eth*"。
+// 管理员明确写出来的网卡不受自动排除规则限制。
+func ifaceSelected(name string, only map[string]bool) bool {
+	if only[name] {
 		return true
 	}
-	for _, p := range []string{"docker", "veth", "br-", "virbr", "cni", "flannel", "kube", "cali"} {
-		if strings.HasPrefix(name, p) {
+	for pat := range only {
+		if ok, err := filepath.Match(pat, name); err == nil && ok {
 			return true
 		}
 	}
@@ -170,7 +191,7 @@ func parseNetDevIfaces(text string, only map[string]bool) map[string]ifCounters 
 		}
 		name := strings.TrimSpace(line[:i])
 		if len(only) > 0 {
-			if !only[name] {
+			if !ifaceSelected(name, only) {
 				continue
 			}
 		} else if ifaceExcluded(name) {

@@ -199,9 +199,9 @@ func TestStateAdvance(t *testing.T) {
 	if s.RX != 500 || s.TX != 600 {
 		t.Fatalf("after delta: %+v", s)
 	}
-	s.advance(one(100, 50), t0.Add(2*time.Minute), day1, "") // 计数器被重置
-	if s.RX != 600 || s.TX != 650 {
-		t.Fatalf("after reset: %+v", s)
+	s.advance(one(100, 50), t0.Add(2*time.Minute), day1, "") // 计数器被重置：这一段按 0 处理，只重建基线（和 Komari 一致）
+	if s.RX != 500 || s.TX != 600 {
+		t.Fatalf("after reset must add nothing: %+v", s)
 	}
 	s.advance(one(200, 80), time.Date(2026, 11, 1, 0, 5, 0, 0, time.UTC), day1, "") // 新周期，累计清零后再加增量
 	if s.Period != "2026-11-01" || s.RX != 100 || s.TX != 30 {
@@ -693,9 +693,9 @@ func TestStateAdvanceIgnoresStaleSnapshot(t *testing.T) {
 	if s.RX != 1600 || s.TX != 900 {
 		t.Fatalf("after stale: RX=%d TX=%d", s.RX, s.TX)
 	}
-	s.advance(one(100, 50), t0.Add(9*time.Second), rule, "") // 真正的计数器重置（读数是新的）仍按重置处理
-	if s.RX != 1700 || s.TX != 950 {
-		t.Fatalf("real reset: RX=%d TX=%d", s.RX, s.TX)
+	s.advance(one(100, 50), t0.Add(9*time.Second), rule, "") // 真正的计数器重置（读数是新的）：不加流量，只重建基线
+	if s.RX != 1600 || s.TX != 900 {
+		t.Fatalf("real reset must add nothing: RX=%d TX=%d", s.RX, s.TX)
 	}
 }
 
@@ -801,15 +801,20 @@ func TestStateAdvancePerInterface(t *testing.T) {
 	if s.RX != 2500 || s.TX != 2500 {
 		t.Fatalf("网卡消失不能产生假流量: RX=%d TX=%d", s.RX, s.TX)
 	}
-	// 新网卡出现：它从创建起的流量都是新增的
+	// 新网卡出现：只记下基线，它的累计值不能当作新增流量（和 Komari 一致）；eth0 照常 +1000
 	s.advance(two(50_000_003_000, 700), t0.Add(3*time.Minute), rule, "")
-	if s.RX != 4200 || s.TX != 4200 {
-		t.Fatalf("新网卡的流量要算进来: RX=%d TX=%d", s.RX, s.TX)
+	if s.RX != 3500 || s.TX != 3500 {
+		t.Fatalf("新网卡出现时只建基线，不能把累计值算进来: RX=%d TX=%d", s.RX, s.TX)
 	}
-	// 单块网卡的计数器被重置，仍按重置处理
+	// 单块网卡的计数器被重置：eth0 这一段按 0 处理，vnet0 照常 +100
 	s.advance(two(100, 800), t0.Add(4*time.Minute), rule, "")
-	if s.RX != 4200+100+100 || s.TX != 4200+100+100 {
+	if s.RX != 3600 || s.TX != 3600 {
 		t.Fatalf("单块网卡重置: RX=%d TX=%d", s.RX, s.TX)
+	}
+	// 之后从新基线继续正常累计
+	s.advance(two(600, 850), t0.Add(5*time.Minute), rule, "")
+	if s.RX != 3600+500+50 || s.TX != 3600+500+50 {
+		t.Fatalf("重置后继续累计: RX=%d TX=%d", s.RX, s.TX)
 	}
 }
 
@@ -845,5 +850,69 @@ func TestParseNetDevIfaces(t *testing.T) {
 	got := parseNetDevIfaces(netDevSample, map[string]bool{})
 	if len(got) != 2 || got["eth0"] != (ifCounters{RX: 1000, TX: 2000}) || got["ens3"] != (ifCounters{RX: 300, TX: 400}) {
 		t.Fatalf("auto: %+v", got)
+	}
+}
+
+// 自动汇总排除的网卡前缀和 Komari Agent 一致：桥接、tap、Proxmox 的 vmbr/fwbr/fwpr、podman 等都不算，否则同一份流量会被重复计数。
+func TestIfaceExcludedMatchesKomari(t *testing.T) {
+	for _, n := range []string{"lo", "br0", "br-1a2b3c", "bridge0", "cni0", "docker0", "podman0", "flannel.1", "veth1a",
+		"virbr0", "vmbr0", "tap100i0", "fwbr100i0", "fwpr100p0", "kube-ipvs0", "cali1234"} {
+		if !ifaceExcluded(n) {
+			t.Errorf("%s 应该被排除", n)
+		}
+	}
+	for _, n := range []string{"eth0", "ens3", "enp1s0", "eno1", "wlan0", "wg0", "tailscale0", "tun0", "ppp0"} {
+		if ifaceExcluded(n) {
+			t.Errorf("%s 不应该被排除", n)
+		}
+	}
+	const sample = `Inter-|   Receive                                                |  Transmit
+ face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed
+    lo: 1 0 0 0 0 0 0 0 1 0 0 0 0 0 0 0
+  eno1: 1000 0 0 0 0 0 0 0 2000 0 0 0 0 0 0 0
+ vmbr0: 1000 0 0 0 0 0 0 0 2000 0 0 0 0 0 0 0
+tap100i0: 1000 0 0 0 0 0 0 0 2000 0 0 0 0 0 0 0
+fwbr100i0: 1000 0 0 0 0 0 0 0 2000 0 0 0 0 0 0 0
+    br0: 1000 0 0 0 0 0 0 0 2000 0 0 0 0 0 0 0
+`
+	if rx, tx := parseNetDev(sample, map[string]bool{}); rx != 1000 || tx != 2000 {
+		t.Fatalf("桥接/tap 的流量不能再算一遍: rx=%d tx=%d", rx, tx)
+	}
+}
+
+// 统计网卡白名单支持通配符；明确写出的网卡不受自动排除规则限制。
+func TestIfaceWhitelistWildcard(t *testing.T) {
+	const sample = `Inter-|   Receive                                                |  Transmit
+ face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed
+  eth0: 100 0 0 0 0 0 0 0 200 0 0 0 0 0 0 0
+  eth1: 10 0 0 0 0 0 0 0 20 0 0 0 0 0 0 0
+  ens3: 5 0 0 0 0 0 0 0 6 0 0 0 0 0 0 0
+ vmbr0: 7 0 0 0 0 0 0 0 8 0 0 0 0 0 0 0
+`
+	if rx, tx := parseNetDev(sample, splitIfaces("eth*")); rx != 110 || tx != 220 {
+		t.Fatalf("eth*: rx=%d tx=%d", rx, tx)
+	}
+	if rx, tx := parseNetDev(sample, splitIfaces("ens3, vmbr0")); rx != 12 || tx != 14 {
+		t.Fatalf("explicit: rx=%d tx=%d", rx, tx)
+	}
+}
+
+// 网卡读数抖动（某次读数里少了一块网卡，下次又出现）时，重新出现的网卡只重建基线，不能把整个累计值加进当月流量。
+func TestStateAdvanceReappearingInterface(t *testing.T) {
+	rule := resetRule{Day: 1}
+	s := &state{}
+	t0 := time.Date(2026, 10, 10, 12, 0, 0, 0, time.UTC)
+	two := func(a, b uint64) map[string]ifCounters {
+		return map[string]ifCounters{"eth0": {RX: a, TX: a}, "eth1": {RX: b, TX: b}}
+	}
+	s.advance(two(1000, 8_000_000_000), t0, rule, "")
+	s.advance(map[string]ifCounters{"eth0": {RX: 1100, TX: 1100}}, t0.Add(time.Minute), rule, "") // eth1 这次没读到
+	s.advance(two(1200, 8_000_000_500), t0.Add(2*time.Minute), rule, "")                         // eth1 回来了
+	if s.RX != 200 || s.TX != 200 {
+		t.Fatalf("重新出现的网卡不能产生假流量: RX=%d TX=%d", s.RX, s.TX)
+	}
+	s.advance(two(1300, 8_000_000_700), t0.Add(3*time.Minute), rule, "")
+	if s.RX != 200+100+200 || s.TX != 200+100+200 {
+		t.Fatalf("基线重建后继续累计: RX=%d TX=%d", s.RX, s.TX)
 	}
 }
