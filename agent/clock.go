@@ -111,7 +111,7 @@ func (c *clockSync) add(s clockSample) {
 	}
 }
 
-// syncClock 在启动时先向 Worker 的首页发一次 GET，拿到响应里的 Date 头：这样第一次上报之前就已经完成校准，
+// syncClock 在启动时先向 Worker 发一次 OPTIONS 请求（Worker 对它直接返回 204，不碰数据库），拿到响应里的 Date 头：这样第一次上报之前就已经完成校准，
 // 不会让第一份指标带着未校准的开机时间。失败（网络不通）不影响后面的流程，之后每次 HTTP 上报和实时连接握手也会继续校准。
 func (r *reporter) syncClock(ctx context.Context) {
 	u, err := url.Parse(r.url)
@@ -121,7 +121,7 @@ func (r *reporter) syncClock(ctx context.Context) {
 	u.Path, u.RawPath, u.RawQuery, u.Fragment = "/", "", "", ""
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodOptions, u.String(), nil)
 	if err != nil {
 		return
 	}

@@ -178,9 +178,9 @@ func TestBuildMetricsTrafficPeriodUsesSkew(t *testing.T) {
 
 func TestSyncClockUsesRootPathAndDate(t *testing.T) {
 	c := useClock(t)
-	var gotPath, gotQuery string
+	var gotPath, gotQuery, gotMethod string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotPath, gotQuery = r.URL.Path, r.URL.RawQuery
+		gotPath, gotQuery, gotMethod = r.URL.Path, r.URL.RawQuery, r.Method
 		w.Header().Set("Date", time.Now().Add(time.Hour).UTC().Format(http.TimeFormat)) // 模拟 Worker 比本机快 1 小时
 		_, _ = w.Write([]byte("CFSM Lite is running."))
 	}))
@@ -189,6 +189,9 @@ func TestSyncClockUsesRootPathAndDate(t *testing.T) {
 	rep.syncClock(context.Background())
 	if gotPath != "/" || gotQuery != "" {
 		t.Fatalf("sync must request the site root, got %q ? %q", gotPath, gotQuery)
+	}
+	if gotMethod != http.MethodOptions {
+		t.Fatalf("sync must use OPTIONS (cheap on the Worker), got %s", gotMethod)
 	}
 	if got := c.get(); got < time.Hour-3*time.Second || got > time.Hour+3*time.Second {
 		t.Fatalf("applied = %v, want about 1h", got)
