@@ -111,10 +111,13 @@ func dialWS(ctx context.Context, rawURL string, hdr http.Header) (*wsConn, error
 		Transport:     tr,
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}
+	sent := time.Now()
 	resp, err := client.Do(req)
+	recv := time.Now()
 	if err != nil {
 		return nil, err
 	}
+	clk.observe(resp.Header, sent, recv) // 握手响应同样带 Date 头；新建连接的往返较长，只有在更准确时才会被采用
 	if resp.StatusCode != http.StatusSwitchingProtocols {
 		_ = resp.Body.Close()
 		return nil, &handshakeError{Status: resp.StatusCode}

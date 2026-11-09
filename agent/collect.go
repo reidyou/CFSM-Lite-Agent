@@ -173,19 +173,27 @@ func buildMetrics(a, b snapshot, cfg config, st *state, heavy, ping map[string]a
 	// 还没拿到服务端配置（首次启动、或旧版本升级后状态文件里还没有保存配置）时只读取、不累计：
 	// 默认配置的重置日、时区、网卡可能和服务端不同，用它累计会清零或重建基线。
 	// 等配置同步后，下一次累计会把这段时间内网卡计数器的增量一并补上。
+	skew := clk.get()
 	if cfg.Synced {
-		st.advance(b.ifs, b.at, cfg.rule(), cfg.Interface)
+		// 读数的先后顺序仍按本机时间判断（st.advance 里丢弃过期读数），只有划分统计周期时才加上校准量
+		rule := cfg.rule()
+		rule.Skew = skew
+		st.advance(b.ifs, b.at, rule, cfg.Interface)
 		st.calibrate(cfg)
 	}
 	rxMonthly, txMonthly := st.monthly()
 	mem := parseMeminfo(readFileString("/proc/meminfo"))
+	bootMs := b.btime * 1000
+	if b.btime > 0 {
+		bootMs += skew.Milliseconds() // btime 按本机时钟算，本机时钟不准时用校准量修正
+	}
 	m := map[string]any{
 		"cpu":            cpuPercent(a.cpuTotal, a.cpuIdle, b.cpuTotal, b.cpuIdle),
 		"ram_total":      mem.RAMTotal,
 		"ram_used":       mem.RAMUsed,
 		"swap_total":     mem.SwapTotal,
 		"swap_used":      mem.SwapUsed,
-		"boot_time":      b.btime * 1000,
+		"boot_time":      bootMs,
 		"net_rx":         b.rx,
 		"net_tx":         b.tx,
 		"net_rx_monthly": rxMonthly,

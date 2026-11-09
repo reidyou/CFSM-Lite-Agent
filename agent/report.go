@@ -50,11 +50,14 @@ func (r *reporter) send(ctx context.Context, metrics map[string]any, cfgMD5 stri
 	req.Header.Set("X-Agent-Version", "Lite-agent-"+version)
 	req.Header.Set("X-Agent-Config-Schema", "7")
 	req.Header.Set("X-Agent-Config-Md5", cfgMD5)
+	sent := time.Now()
 	resp, err := r.client.Do(req)
+	recv := time.Now()
 	if err != nil {
 		return reply{}, err
 	}
 	defer resp.Body.Close()
+	clk.observe(resp.Header, sent, recv) // 用响应头里的 Date 校准本机时钟差（见 clock.go）
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
 	if err != nil {
 		return reply{}, fmt.Errorf("读取响应失败: %w", err)

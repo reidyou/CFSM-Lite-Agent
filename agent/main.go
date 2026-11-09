@@ -110,6 +110,7 @@ func run(ctx context.Context, s settings) {
 	pingDebug = s.Debug
 	go newPinger(sh).run(ctx, box) // 后台持续采样延迟和丢包，上报时只取统计结果
 	rep := newReporter(s)
+	rep.syncClock(ctx) // 先校准本机时钟差，第一份指标的开机时间才是准的
 	cfgMD5 := "none"
 	warnedICMP := false
 	failures := 0

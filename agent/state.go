@@ -133,6 +133,7 @@ func delta(cur, last uint64) uint64 {
 type resetRule struct {
 	Day, Hour, Minute int
 	Loc               *time.Location
+	Skew              time.Duration // 时间校准量（Worker 时间 − 本机时间），划分周期时先加上它；0 表示不校准
 }
 
 // rule 取出配置里的重置规则。
@@ -208,7 +209,7 @@ func periodKey(now time.Time, rule resetRule) string {
 	if loc == nil {
 		loc = now.Location()
 	}
-	now = now.In(loc)
+	now = now.Add(rule.Skew).In(loc)
 	y, m, _ := now.Date()
 	day := rule.Day
 	if dm := daysIn(y, m, loc); day > dm {
