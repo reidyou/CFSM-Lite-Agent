@@ -54,7 +54,7 @@ Agent ──① 每个上报间隔 HTTP POST /update（带完整指标；响应�
 
 ## 2. 系统要求
 
-- Linux，CPU 架构 x86_64（amd64）、arm64，或 32 位 ARM（armv7l，例如 32 位的 Armbian 开发板）。
+- Linux，CPU 架构 x86_64（amd64）或 arm64（包括 64 位的 Armbian 开发板）。
 - 使用 systemd（Debian、Ubuntu、Armbian、CentOS、Rocky、Fedora 等常见发行版都是），或 OpenRC（Alpine）。
 - 已安装 `curl`（Alpine 上缺少时脚本会自动用 `apk` 补装）；安装时需要 root 权限。
 - 服务器能访问你的 Worker 域名（HTTPS，443 端口）；安装时还要能访问 `github.com`（下载程序）。
@@ -75,7 +75,7 @@ Agent ──① 每个上报间隔 HTTP POST /update（带完整指标；响应�
 
 ### 3.2 确认自动编译通过
 
-1. 打开仓库的 Actions 页，应该能看到名为 `ci` 的任务自动运行。它会做静态检查、运行单元测试，并对 amd64、arm64 和 armv7 各编译一次。
+1. 打开仓库的 Actions 页，应该能看到名为 `ci` 的任务自动运行。它会做静态检查、运行单元测试，并对 amd64 和 arm64 各编译一次（测试带 `-race` 竞态检测）。
 2. 变成绿色表示通过。**这也是代码第一次真正编译**，如果变红，点进去看日志，把报错原文发给我，不要继续往下做。
 
 ### 3.3 发布 Release
@@ -83,7 +83,7 @@ Agent ──① 每个上报间隔 HTTP POST /update（带完整指标；响应�
 1. 进入仓库的 Releases → Draft a new release。
 2. Tag 输入 `v1.0.0`，选择 Create new tag，标题随意，点 Publish release。
 3. 回到 Actions 页，等名为 `release` 的任务完成（约 1 到 2 分钟）。它会编译两个架构的程序，生成校验文件，并上传到这个 Release。
-4. 打开 Release 页面，应该能看到四个文件：`cfsm-lite-agent-linux-amd64`、`cfsm-lite-agent-linux-arm64`、`cfsm-lite-agent-linux-armv7`、`SHA256SUMS`。
+4. 打开 Release 页面，应该能看到三个文件：`cfsm-lite-agent-linux-amd64`、`cfsm-lite-agent-linux-arm64`、`SHA256SUMS`。
 
 ### 3.4 以后发布新版本
 
@@ -128,11 +128,11 @@ curl -fsSL https://raw.githubusercontent.com/用户名/CFSM-Lite-Agent/main/inst
 ### 4.4 脚本做了什么
 
 1. 检查是 root、服务管理器是 systemd 或 OpenRC（Alpine）、有 curl（Alpine 上缺少 `curl`、`ca-certificates` 时自动补装）、参数齐全、上报地址以 `https://` 开头。
-2. 根据 CPU 架构下载对应的程序，同时下载 `SHA256SUMS` 校验文件并核对；校验失败就中止（拿不到校验文件时会提示警告并继续）。
+2. 根据 CPU 架构下载对应的程序，同时下载 `SHA256SUMS` 校验文件并核对；校验失败就中止（拿不到校验文件时会提示警告并继续）。下载只走 HTTPS（重定向也一样）、至少 TLS 1.2，网络抖动时自动重试 3 次，连接超过 10 秒、程序下载超过 300 秒（校验文件 60 秒）会放弃，不会一直卡住。
 3. 把程序放到 `/opt/cfsm-lite/cfsm-lite-agent`。
 4. 把上报地址、节点 ID、密钥写入 `/opt/cfsm-lite/agent.env`，文件权限 600，只有 root 能读。
-5. 创建服务 `cfsm-lite-agent` 并启动：systemd 系统是 `/etc/systemd/system/cfsm-lite-agent.service`；Alpine 是 OpenRC 脚本 `/etc/init.d/cfsm-lite-agent`（用 supervise-daemon 守护，异常退出 10 秒后重启，日志写到 `/var/log/cfsm-lite-agent.log`，超过 5MB 时在下次启动时清空；Alpine 上无法使用下面 systemd 的沙箱保护项）。两种系统的程序、`agent.env`、`state.json` 路径完全相同，创建的服务用户也都是 `cfsm-lite`。下面的描述以 systemd 为准：服务以专门创建的低权限系统用户 `cfsm-lite` 运行（只能写 `/opt/cfsm-lite` 这一个目录），并开启这些保护：`ReadWritePaths` 只开放该目录、`NoNewPrivileges`、`ProtectSystem=strict`、`ProtectHome=read-only`、`PrivateTmp`、不授予任何额外权限（`CapabilityBoundingSet` 为空）。`ProtectHome` 用只读而不是完全隐藏，是为了让单独挂载在 `/home` 的磁盘也能被统计到。
-6. 当月流量的累计状态保存在 `/opt/cfsm-lite/state.json`（和程序在同一目录；服务以专门的系统用户 `cfsm-lite` 运行，只有这个目录归它所有，程序和 `agent.env` 仍归 root；从旧版本升级时，安装脚本会把旧位置的状态文件迁移过来）。同一个文件里还保存着最近一次从 Worker 收到的配置（重置日、重置时刻、时区、统计网卡等），所以重启服务或重新执行安装命令升级后，Agent 会先按这份配置接着累计，不会因为尚未连上 Worker 而用默认值把当月流量清零。
+5. 创建服务 `cfsm-lite-agent` 并启动：systemd 系统是 `/etc/systemd/system/cfsm-lite-agent.service`；Alpine 是 OpenRC 脚本 `/etc/init.d/cfsm-lite-agent`（用 supervise-daemon 守护，异常退出 10 秒后重启，日志写到 `/var/log/cfsm-lite-agent.log`，超过 5MB 时在下次启动时清空；Alpine 上无法使用下面 systemd 的沙箱保护项）。两种系统的程序、`agent.env`、`state.json` 路径完全相同，创建的服务用户也都是 `cfsm-lite`。下面的描述以 systemd 为准：服务以专门创建的低权限系统用户 `cfsm-lite` 运行（只能写 `/opt/cfsm-lite` 这一个目录），并开启这些保护：`ReadWritePaths` 只开放该目录、`NoNewPrivileges`、`ProtectSystem=strict`、`ProtectHome=read-only`、`PrivateTmp`、不授予任何额外权限（`CapabilityBoundingSet` 为空）；以及一组扩展加固：`PrivateDevices`、`ProtectKernelTunables`、`ProtectKernelModules`、`ProtectKernelLogs`、`ProtectControlGroups`、`ProtectClock`、`ProtectHostname`、`RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX`（只允许 IPv4、IPv6 和本地套接字）、`RestrictNamespaces`、`RestrictRealtime`、`RestrictSUIDSGID`、`LockPersonality`、`SystemCallArchitectures=native`、`UMask=0077`，并限制内存 `MemoryMax=128M` 和线程数 `TasksMax=128`（`systemd-analyze security` 的评分从 5.9 降到 3.1）。扩展加固刻意没有包含 `ProtectProc=invisible`，它会让「进程数」只统计到 Agent 自己。如果个别系统不接受这些扩展项导致服务启动失败，脚本会打印警告，自动退回只含基础保护的服务文件再试一次`ProtectHome` 用只读而不是完全隐藏，是为了让单独挂载在 `/home` 的磁盘也能被统计到。
+6. 当月流量的累计状态保存在 `/opt/cfsm-lite/state.json`（和程序在同一目录；服务以专门的系统用户 `cfsm-lite` 运行，只有这个目录归它所有，程序和 `agent.env` 仍归 root；从旧版本升级时，安装脚本会把旧位置的状态文件迁移过来）。同一个文件里还保存着最近一次从 Worker 收到的配置（重置日、重置时刻、时区、统计网卡等），状态文件先写临时文件并 `fsync`，再改名替换，断电也不会留下空文件或半截文件，并保留一份最多落后约 10 分钟的备份 `state.json.bak`；主文件万一损坏，Agent 会在日志里说明，自动用备份恢复（没有备份才从 0 开始，损坏的文件保留为 `state.json.corrupt`）。所以重启服务或重新执行安装命令升级后，Agent 会先按这份配置接着累计，不会因为尚未连上 Worker 而用默认值把当月流量清零。
 
 ### 4.5 日常管理
 
@@ -201,7 +201,7 @@ Agent 本地只有三项必需配置：上报地址、节点 ID、上报密钥�
 | HTTP 上报返回其他状态码 | 记录日志，下个周期继续 |
 | 实时连接握手返回 503 或 403 | 服务端没有启用实时推送，或这个节点被设为仅 HTTP；5 分钟后再试 |
 | 实时连接握手返回 400、401、404，或连接被关闭时带 1008、4404 | ID 或密钥有问题，或节点被删；120 秒后再试 |
-| 实时连接其他原因断开 | 5 秒后重连，之后每次失败等待时间翻倍，最长 5 分钟；连接稳定超过 1 分钟后恢复为 5 秒 |
+| 实时连接其他原因断开 | 5 秒后重连，之后每次失败等待时间翻倍，最长 5 分钟；连接稳定超过 1 分钟后恢复为 5 秒。每次等待都会加上 ±20% 的随机量，避免服务端重新部署后所有节点在同一时刻重连 |
 
 实时连接的任何问题都不影响 HTTP 上报；实时连接相关的日志每分钟最多输出一次。
 
@@ -215,7 +215,8 @@ Agent 本地只有三项必需配置：上报地址、节点 ID、上报密钥�
   - 同一块设备挂载多次只算一次，所以 bind 挂载和 btrfs 子卷不会重复累加；
   - **ZFS**：文件系统类型为 zfs 的数据集也统计；同一个存储池下的多个数据集只算一份，取其中容量最大的那个（和 Komari 一致）。这是近似值：多数据集的存储池、以及存储池里没有挂载的 zvol（例如 Proxmox 的虚拟机磁盘），都不会完整反映在这个数字里，要精确值请以 `zpool list` 为准；
   - **根目录 `/` 始终统计**（和 Komari 一致）：LXC 等容器的根文件系统可能是 loop 设备、ZFS 子卷或 overlay，不在上面的规则里，不算的话磁盘会显示成 0；旧内核可能先列出一行 `rootfs`，只取最后一个 `/`；
-  - 如果一个都没识别出来，退回到只统计根目录。
+  - 如果一个都没识别出来，退回到只统计根目录；
+  - **卡死保护**：每个挂载点的用量读取都有 3 秒超时。个别挂载卡死（例如 ntfs-3g 进程挂掉、磁盘故障）时，这个挂载点暂时沿用上一次的数值并在日志里提示（每分钟最多一条），不会再拖住上报和实时推送，也不影响其他磁盘；它恢复后自动回到正常读数。
 - **流量**：读取 `/proc/net/dev`。默认汇总所有网卡，排除 `lo`、`br`、`cni`、`docker`、`podman`、`flannel`、`veth`、`virbr`、`vmbr`、`tap`、`fwbr`、`fwpr`（与 Komari Agent 一致）以及 `kube`、`cali` 开头的虚拟网卡——这些网卡上的流量会从物理网卡再走一遍，算进去就是重复计数；可由「统计网卡」指定，支持 `*`、`?` 通配符（例如 `eth*`），明确写出的网卡不受上述排除限制。
   - 累计上下行（`net_rx`、`net_tx`）是网卡计数器的原始值；
   - 实时网速由两次读数的差值除以间隔得到，计数器回绕或网卡重置时按 0 处理，不会出现负数；
@@ -227,7 +228,7 @@ Agent 本地只有三项必需配置：上报地址、节点 ID、上报密钥�
   - **何时生效**：差值达到 5 秒才开始校准（估算误差在 1 到 2 秒内，小于 5 秒视为准确）；已经在校准时，差值降到 2 秒以下才取消，避免在阈值附近来回切换。生效、取消或变化超过 5 秒时输出一条日志，提示本机时钟偏快或偏慢了多少，并建议检查 NTP 同步。
   - **读数先后**不受影响：累计流量时判断「这组读数是不是比上次更早」仍按本机时间，只有划分统计周期时才加上校准量。
 - **IP 可用性**：用 UDP「连接」检查本机是否有到公网的 IPv4、IPv6 路由（不会真的发送数据包），结果为 `1` 或 `0`。
-- **连接数**：TCP 只统计 ESTABLISHED 状态的连接；UDP 统计套接字数量。
+- **连接数**：TCP 只统计 ESTABLISHED 状态的连接；UDP 统计套接字数量。逐行流式扫描 `/proc/net/{tcp,tcp6,udp,udp6}`，连接数很多的机器上也几乎不产生内存垃圾（5 万条连接实测约 5 毫秒）。
 
 ---
 
@@ -274,7 +275,8 @@ Agent 本地只有三项必需配置：上报地址、节点 ID、上报密钥�
 - 上报地址必须是 `https://`；不跟随重定向，避免密钥被带到别的地址。
 - 密钥只保存在 root 才能读的 `/opt/cfsm-lite/agent.env`；日志不输出密钥或完整请求头。
 - 只接受白名单里的几项配置，任何一项不合法就整体忽略；配置串有 1024 字节上限。
-- systemd 服务以临时的低权限用户运行，不授予额外权限，系统目录只读，家目录只读。
+- systemd 服务以专门的低权限用户运行，不授予额外权限，系统目录只读，家目录只读，并启用扩展加固（见 4.4）。
+- 下载程序只走 HTTPS 并带超时和重试（见 4.4）；CI 始终使用当前受支持的最新 Go 版本编译，标准库的安全修复才会进入发布的程序。
 - 安装脚本下载程序后用 `SHA256SUMS` 校验。
 - 只使用 Go 标准库，没有第三方依赖，也就没有依赖带来的供应链风险。
 
@@ -293,6 +295,8 @@ Agent 本地只有三项必需配置：上报地址、节点 ID、上报密钥�
 | `实时推送连接断开：WebSocket 握手失败：HTTP 403` | 这个节点的连接模式被设成了「仅 HTTP POST」，改回「自动」即可 |
 | `提示：Lite Agent 只支持 TCP 探测，已自动使用 TCP` | 在管理页把探测方式选成了 ICMP，Lite Agent 不支持，已自动改用 TCP，无需处理 |
 | `忽略无效的配置: …` | 服务端下发的配置里有不合法的值，Agent 保持原配置；检查管理页里该节点的设置 |
+| `状态文件 … 损坏（…），尝试从备份恢复` | 状态文件被断电等原因损坏。日志下一行会说明是从备份恢复（最近一小段流量累计可能丢失），还是没有备份、从 0 重新累计；损坏的文件保留为 `state.json.corrupt`，可以删除 |
+| `读取磁盘 /xxx 的用量超过 3s 没有返回` | 这个挂载点卡死了（FUSE 进程挂掉、磁盘故障等），Agent 暂时沿用它上一次的数值，其他指标和上报不受影响；请检查该磁盘或挂载 |
 
 其他常见问题：
 
@@ -309,12 +313,12 @@ Agent 本地只有三项必需配置：上报地址、节点 ID、上报密钥�
 
 ### 10.1 验证状态
 
-- **编译与测试**：代码已用 Go 1.24 编译，`go vet` 和单元测试（含 `-race` 竞态检测）通过；单元测试覆盖配置解析、`/proc` 文件解析、磁盘挂载筛选、流量累计、Ping、WebSocket 帧收发与握手、完整的实时会话等。上传到 GitHub 后请仍然先确认 `ci` 是绿色的（见 3.2）。**还没有在真实服务器上长期运行过。** 时间校准（`clock.go` 与 `clock_test.go`）这一部分的代码，在整理这个版本时所用的环境里没有 Go 工具链，**没有编译也没有运行过**；请务必先看 GitHub 上 `ci` 是否变绿（第 3.2 节），变红就把报错原文发出来。
+- **编译与测试**：代码已用 Go 1.24 编译，`go vet` 和单元测试（含 `-race` 竞态检测）通过，其中包括状态文件并发保存与损坏恢复、磁盘卡死保护、连接数流式统计与旧实现的逐行对照、重连抖动；安装脚本生成的 systemd 服务文件已用 `systemd-analyze verify` 校验；单元测试覆盖配置解析、`/proc` 文件解析、磁盘挂载筛选、流量累计、Ping、WebSocket 帧收发与握手、完整的实时会话等。上传到 GitHub 后请仍然先确认 `ci` 是绿色的（见 3.2）。**还没有在真实服务器上长期运行过。** 时间校准（`clock.go` 与 `clock_test.go`）这一部分的代码也已用 Go 1.24 编译，单元测试（含 `-race`）通过；仍然请先看 GitHub 上 `ci` 是否变绿（第 3.2 节），变红就把报错原文发出来。扩展加固项和卡死挂载的行为**还没有在真实的 systemd 和故障磁盘上验证过**。
 - 没有在真实的 Cloudflare 服务端和 Monito 上验证过；请按服务端 README 的「首次验证清单」检查。
 
 ### 10.2 已知限制
 
-- 只支持 Linux（amd64、arm64 和 armv7）以及 systemd 或 OpenRC。
+- 只支持 Linux（amd64 和 arm64）以及 systemd 或 OpenRC；32 位 ARM（armv7、armhf）不支持，安装脚本会直接提示不支持的架构。
 - 不支持 ICMP 探测，只有 TCP。
 - 不保存历史数据，也没有历史曲线。
 - 自己的实时推送协议和原版 CF-Server-Monitor 的 cfsm-agent **不通用**；原版 Agent 不能连接本项目的实时通道。
@@ -337,6 +341,7 @@ CFSM-Lite-Agent/
 ├── collect.go            指标采集：快照、完整指标构造、实时采样
 ├── parse.go              /proc 文件解析、磁盘挂载筛选与合计
 ├── sys_linux.go          磁盘用量（statfs 系统调用）
+├── diskguard.go          磁盘用量读取的超时保护（挂载卡死时沿用上次数值）
 ├── ping.go               TCP 延迟与丢包：后台采样与窗口统计
 ├── state.go              当月流量累计与统计周期
 ├── clock.go              时间校准：用 HTTP Date 头估算本机时钟偏差
@@ -345,6 +350,7 @@ CFSM-Lite-Agent/
 ├── wsclient.go           最小的 WebSocket 客户端（只用标准库）
 ├── agent_test.go         解析、配置、状态、Ping、上报等的单元测试
 ├── realtime_test.go      WebSocket 与实时会话的单元测试
+├── hardening_test.go     状态文件恢复、磁盘卡死保护、连接数统计、重连抖动的单元测试
 └── .github/workflows/
     ├── ci.yml            每次提交：静态检查、单元测试、两个架构的编译检查
     └── release.yml       发布 Release 时：编译两个架构、生成校验文件并上传
@@ -358,5 +364,5 @@ CFSM-Lite-Agent/
 ## 11. Alpine 与 Armbian 说明
 
 - **静态编译**：所有 Release 文件都用 `CGO_ENABLED=0` 编译，不依赖 glibc，Alpine（musl）直接能运行；时区数据库也编进了程序（`time/tzdata`），Alpine 没装 `tzdata` 也不影响。新增依赖时不要引入需要 CGO 的库，否则 Alpine 上会出现 `not found`。安装脚本会在启动服务前试运行一次下载的程序，无法执行时（退出码 126 / 127）直接中止并提示。
-- **Armbian**：64 位用 arm64 版本，32 位（`uname -m` 为 `armv7l`）用 armv7 版本。ARM 的 `/proc/cpuinfo` 没有 `model name`，CPU 型号依次取 `Hardware`、`Processor`、`Model`，都没有时读设备树 `/proc/device-tree/model`（例如 `Orange Pi 5`）。
-- **本机检查**：`GOOS=linux GOARCH=arm GOARM=7 CGO_ENABLED=0 go build -o /dev/null .`；在 Alpine 容器里跑：`docker run --rm -v "$PWD:/d" alpine:3 /d/cfsm-lite-agent-linux-amd64`，出现 `not found` 说明不是静态编译，程序因为缺少配置而退出则说明二进制没问题。
+- **Armbian**：只支持 64 位（`uname -m` 为 `aarch64`，用 arm64 版本）；32 位系统（`armv7l`、`armv8l`）不支持。ARM 的 `/proc/cpuinfo` 没有 `model name`，CPU 型号依次取 `Hardware`、`Processor`、`Model`，都没有时读设备树 `/proc/device-tree/model`（例如 `Orange Pi 5`）。
+- **本机检查**：`GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o /dev/null .`；在 Alpine 容器里跑：`docker run --rm -v "$PWD:/d" alpine:3 /d/cfsm-lite-agent-linux-amd64`，出现 `not found` 说明不是静态编译，程序因为缺少配置而退出则说明二进制没问题。

@@ -2,7 +2,9 @@ package main
 
 import (
 	"bufio"
+	"io"
 	"math"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -219,26 +221,71 @@ func parseLoadavg(text string) string {
 	return strings.Join(f[:3], " ")
 }
 
-// countSockets 统计 /proc/net/{tcp,udp}[6] 里的条目数；establishedOnly 为真时只数 ESTABLISHED（状态码 01）。
-func countSockets(text string, establishedOnly bool) int {
-	n := 0
-	first := true
-	sc := bufio.NewScanner(strings.NewReader(text))
-	for sc.Scan() {
-		if first {
-			first = false // 表头
-			continue
+// socketLineCounts 判断 /proc/net/{tcp,udp}[6] 的一行是否要计数：至少有 4 个字段；
+// establishedOnly 为真时，第 4 个字段（状态码）必须是 01（ESTABLISHED）。只扫描到第 4 个字段，不分配内存。
+func socketLineCounts(line []byte, establishedOnly bool) bool {
+	i, fld := 0, 0
+	var st []byte
+	for fld < 4 {
+		for i < len(line) && (line[i] == ' ' || line[i] == '\t') {
+			i++
 		}
-		f := strings.Fields(sc.Text())
-		if len(f) < 4 {
-			continue
+		if i >= len(line) || line[i] == '\n' || line[i] == '\r' {
+			return false
 		}
-		if establishedOnly && f[3] != "01" {
-			continue
+		start := i
+		for i < len(line) && line[i] != ' ' && line[i] != '\t' && line[i] != '\n' && line[i] != '\r' {
+			i++
 		}
-		n++
+		fld++
+		if fld == 4 {
+			st = line[start:i]
+		}
 	}
-	return n
+	return !establishedOnly || (len(st) == 2 && st[0] == '0' && st[1] == '1')
+}
+
+// countSocketsReader 流式统计 /proc/net/{tcp,udp}[6] 里的条目数（第一行是表头）；establishedOnly 为真时只数 ESTABLISHED。
+// 连接很多的机器上这几个文件有几兆到几十兆：一次性读成字符串再按行拆分，每次要产生几十兆垃圾，这里逐行扫描，几乎不分配内存。
+// 结果与逐行 strings.Fields 的旧实现一致。br 可以在多次调用之间复用。
+func countSocketsReader(r io.Reader, establishedOnly bool, br *bufio.Reader) int {
+	br.Reset(r)
+	n, first := 0, true
+	for {
+		line, err := br.ReadSlice('\n')
+		full := err == bufio.ErrBufferFull
+		for err == bufio.ErrBufferFull { // 超长行（正常的行只有一百多字节）：丢弃到行尾，不计数
+			_, err = br.ReadSlice('\n')
+		}
+		switch {
+		case full:
+			first = false
+		case len(line) > 0:
+			if first {
+				first = false // 表头
+			} else if socketLineCounts(line, establishedOnly) {
+				n++
+			}
+		}
+		if err != nil {
+			return n
+		}
+	}
+}
+
+// countSockets 统计一段文本里的条目数（测试和小数据用）；读文件请用 countSocketsFile。
+func countSockets(text string, establishedOnly bool) int {
+	return countSocketsReader(strings.NewReader(text), establishedOnly, bufio.NewReaderSize(nil, 4096))
+}
+
+// countSocketsFile 直接从文件流式统计；文件打不开（例如没有 IPv6）时返回 0。
+func countSocketsFile(path string, establishedOnly bool, br *bufio.Reader) int {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0
+	}
+	defer f.Close()
+	return countSocketsReader(f, establishedOnly, br)
 }
 
 func osPrettyName(text string) string {

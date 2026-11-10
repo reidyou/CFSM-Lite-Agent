@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math/rand"
 	"net/http"
 	"sync"
 	"time"
@@ -46,6 +47,13 @@ var (
 	// 期间这台节点收不到 activate，看盘时一直只有每分钟一次的刷新。
 	rtDeadAfter = 2*rtKeepalive + 10*time.Second
 )
+
+// rtJitter 给重连等待加上 ±20% 的随机量。Worker 重新部署时 Durable Object 会断开所有 Agent 的实时连接，
+// 没有随机量的话，所有节点会在同一时刻重连，之后每一轮退避也一起对齐，形成重连风暴。
+// 用变量只是为了让测试可以关闭随机；只用于实时连接的重连，HTTP 上报的周期不受影响。
+var rtJitter = func(d time.Duration) time.Duration {
+	return d + time.Duration((rand.Float64()*0.4-0.2)*float64(d))
+}
 
 // rtInterval 把服务端通知的秒数限制在 1 到 5 秒；不合法时用 fallback。
 func rtInterval(secs float64, fallback time.Duration) time.Duration {

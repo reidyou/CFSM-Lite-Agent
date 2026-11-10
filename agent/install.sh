@@ -99,8 +99,7 @@ case "$ID$SECRET$URL" in *[!A-Za-z0-9._:+/=?@-]*) die "节点 ID、密钥或地�
 case "$(uname -m)" in
   x86_64|amd64) ARCH=amd64 ;;
   aarch64|arm64) ARCH=arm64 ;;
-  armv7l|armv8l|armhf) ARCH=armv7 ;; # 32 位的 Armbian 开发板（需要 Agent 仓库发布 armv7 版本）
-  *) die "不支持的 CPU 架构: $(uname -m)（支持 x86_64、arm64 和 armv7）" ;;
+  *) die "不支持的 CPU 架构: $(uname -m)（支持 x86_64 和 arm64）" ;;
 esac
 
 if [ "$TAG" = latest ]; then
@@ -109,13 +108,15 @@ else
   BASE="https://github.com/$REPO/releases/download/$TAG"
 fi
 NAME="cfsm-lite-agent-linux-$ARCH"
+# 只走 HTTPS（重定向也一样）、至少 TLS 1.2；网络抖动时自动重试，连接和总耗时都有上限，不会一直卡住
+CURL_OPTS="--proto =https --tlsv1.2 --retry 3 --retry-delay 2 --connect-timeout 10"
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 echo "下载 $NAME ..."
-curl -fsSL "$BASE/$NAME" -o "$TMP/$NAME" || die "下载失败: $BASE/$NAME（请确认仓库 $REPO 已发布 Release，并且包含 $ARCH 版本）"
+curl -fsSL $CURL_OPTS --max-time 300 "$BASE/$NAME" -o "$TMP/$NAME" || die "下载失败: $BASE/$NAME（请确认仓库 $REPO 已发布 Release，并且包含 $ARCH 版本）"
 GOT="$NAME"
-if command -v sha256sum >/dev/null 2>&1 && curl -fsSL "$BASE/SHA256SUMS" -o "$TMP/SHA256SUMS" 2>/dev/null; then
+if command -v sha256sum >/dev/null 2>&1 && curl -fsSL $CURL_OPTS --max-time 60 "$BASE/SHA256SUMS" -o "$TMP/SHA256SUMS" 2>/dev/null; then
   (cd "$TMP" && grep " $GOT\$" SHA256SUMS | sha256sum -c - >/dev/null) || die "文件校验失败，可能下载损坏或被篡改，已中止"
   echo "校验通过"
 else
@@ -177,7 +178,12 @@ EOT
 chmod 600 "$ENV_FILE"
 
 if [ "$INIT" = systemd ]; then
-  cat > "$UNIT" <<EOT
+  # 写服务文件：基础加固项一直保留；扩展加固项（full）只收紧 Agent 用不到的能力：
+  # 网络只留 IPv4、IPv6 和本地套接字，内核参数、模块、日志、控制组、系统时钟、主机名一律只读或禁止，隔离设备，
+  # 限制内存和线程数。刻意没有加 ProtectProc=invisible：它会让进程数统计只剩 Agent 自己的进程。
+  write_unit() {
+    {
+      cat <<EOT
 [Unit]
 Description=CFSM Lite Agent
 After=network-online.target
@@ -195,16 +201,49 @@ ProtectSystem=strict
 ProtectHome=read-only
 PrivateTmp=yes
 CapabilityBoundingSet=
+EOT
+      if [ "$1" = full ]; then
+        cat <<'EOT'
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+UMask=0077
+MemoryMax=128M
+TasksMax=128
+EOT
+      fi
+      cat <<'EOT'
 
 [Install]
 WantedBy=multi-user.target
 EOT
-  chmod 644 "$UNIT"
+    } > "$UNIT"
+    chmod 644 "$UNIT"
+  }
 
+  write_unit full
   systemctl daemon-reload
   systemctl enable cfsm-lite-agent >/dev/null 2>&1
-  systemctl restart cfsm-lite-agent
+  systemctl restart cfsm-lite-agent || true
   sleep 3
+  if ! systemctl is-active --quiet cfsm-lite-agent; then
+    # 个别系统（很旧的 systemd、特殊内核）可能不接受扩展加固项：退回基础加固再试一次，保证 Agent 能运行
+    echo "警告: 启用扩展加固后服务没有正常启动，改用基础加固重试" >&2
+    write_unit basic
+    systemctl daemon-reload
+    systemctl restart cfsm-lite-agent || true
+    sleep 3
+  fi
   if systemctl is-active --quiet cfsm-lite-agent; then
     echo "安装完成。查看运行日志: journalctl -u cfsm-lite-agent -f"
   else

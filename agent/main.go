@@ -125,9 +125,8 @@ func run(ctx context.Context, s settings) {
 		if ctx.Err() != nil {
 			return
 		}
-		if err := st.save(s.StatePath); err != nil && s.Debug {
-			log.Printf("保存状态文件失败: %v", err)
-		}
+		// 状态文件由 saveLoop 每 30 秒（有变化时）和退出时保存，这里不再每轮都写一次：
+		// 少一次无谓的写入，对 SD 卡、eMMC 这类闪存的开发板更友好。收到新配置时仍会立即保存（见下）。
 
 		wait := cfg.ReportInterval
 		res, err := rep.send(ctx, metrics, cfgMD5)

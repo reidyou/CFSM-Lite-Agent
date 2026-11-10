@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"net"
 	"os"
@@ -117,9 +118,9 @@ func reachable(network, addr string) string {
 // 网络挂载和虚拟文件系统不计入，同一块磁盘被挂载多次只算一次。如果一个都没识别出来，退回到只统计根目录。
 func diskTotals() (totalMB, usedMB int64) {
 	mounts := selectDiskMounts(parseMounts(readFileString("/proc/self/mounts")))
-	totalMB, usedMB = sumDisks(mounts, statfsBytes)
+	totalMB, usedMB = sumDisks(mounts, diskStat)
 	if totalMB == 0 {
-		return sumDisks([]mountEntry{{Device: "/", Point: "/", FSType: "root"}}, statfsBytes)
+		return sumDisks([]mountEntry{{Device: "/", Point: "/", FSType: "root"}}, diskStat)
 	}
 	return totalMB, usedMB
 }
@@ -147,8 +148,9 @@ func (s *sharedData) getPing() map[string]any {
 func readHeavy() map[string]any {
 	diskTotal, diskUsed := diskTotals()
 	info := loadStatic()
-	tcp := countSockets(readFileString("/proc/net/tcp"), true) + countSockets(readFileString("/proc/net/tcp6"), true)
-	udp := countSockets(readFileString("/proc/net/udp"), false) + countSockets(readFileString("/proc/net/udp6"), false)
+	br := bufio.NewReaderSize(nil, 64<<10) // 四个文件共用一个读缓冲
+	tcp := countSocketsFile("/proc/net/tcp", true, br) + countSocketsFile("/proc/net/tcp6", true, br)
+	udp := countSocketsFile("/proc/net/udp", false, br) + countSocketsFile("/proc/net/udp6", false, br)
 	return map[string]any{
 		"disk_total":     diskTotal,
 		"disk_used":      diskUsed,
