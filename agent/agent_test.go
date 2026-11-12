@@ -765,7 +765,7 @@ func TestStateAdvanceIgnoresStaleSnapshot(t *testing.T) {
 func TestRestartKeepsMonthlyTraffic(t *testing.T) {
 	path := t.TempDir() + "/state.json"
 	body := "report_interval=60&reset_day=5&interface=eth0"
-	old := &state{Period: "2026-11-05", Iface: "eth0", RX: 1000, TX: 2000, LastRX: 5000, LastTX: 6000, Init: true}
+	old := &state{Period: "2026-11-05", Iface: "eth0", RX: 1000, TX: 2000, LastRX: 5000, LastTX: 6000, Init: true, Ifs: one(5000, 6000)}
 	old.setCfg(body)
 	if err := old.save(path); err != nil {
 		t.Fatal(err)
@@ -789,9 +789,9 @@ func TestRestartKeepsMonthlyTraffic(t *testing.T) {
 	}
 }
 
-// 还没拿到服务端配置（例如从没保存过配置的旧版本升级）时，不能用默认配置累计，也不能清零已有的累计。
+// 还没拿到服务端配置（例如状态文件里还没有保存配置）时，不能用默认配置累计，也不能清零已有的累计。
 func TestUnsyncedConfigKeepsState(t *testing.T) {
-	st := &state{Period: "2026-11-05", Iface: "eth0", RX: 1000, TX: 2000, LastRX: 5000, LastTX: 6000, Init: true}
+	st := &state{Period: "2026-11-05", Iface: "eth0", RX: 1000, TX: 2000, LastRX: 5000, LastTX: 6000, Init: true, Ifs: one(5000, 6000)}
 	cfg := defaultConfig()
 	if cfg.Synced {
 		t.Fatal("default config must not count as synced")
