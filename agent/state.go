@@ -29,7 +29,6 @@ type state struct {
 	LastRX uint64 `json:"last_rx"` // 上次读到的所有统计网卡的合计值
 	LastTX uint64 `json:"last_tx"`
 	// 上次读到的每块网卡各自的累计值。增量按网卡分别算，网卡增减（虚拟机、容器、VPN 隧道起停）才不会算出巨大的假流量。
-	// 旧版本的状态文件里没有这一项，升级后的第一次累计仍按合计值算，之后自动带上。
 	Ifs   map[string]ifCounters `json:"ifs,omitempty"`
 	Init  bool                  `json:"init"`
 	CalID string                `json:"cal_id"` // 最近一次应用的手动校准编号，避免同一次校准重复应用
@@ -252,20 +251,15 @@ func (s *state) advance(ifs map[string]ifCounters, now time.Time, rule resetRule
 		s.RX, s.TX = 0, 0
 	}
 	if s.Init {
-		if s.Ifs != nil {
-			for name, c := range ifs {
-				if last, ok := s.Ifs[name]; ok {
-					s.RX += delta(c.RX, last.RX)
-					s.TX += delta(c.TX, last.TX)
-				}
-				// 上次读数之后才出现的网卡（含读数抖动后重新出现的）：这次只记下基线，不把它的累计值当作新增流量，
-				// 和 Komari Agent 一致（lastCounters 里没有的网卡首次采样不记录）。
+		for name, c := range ifs {
+			if last, ok := s.Ifs[name]; ok {
+				s.RX += delta(c.RX, last.RX)
+				s.TX += delta(c.TX, last.TX)
 			}
-			// 上次有、这次没有的网卡直接忽略：它的流量已经累计过了，合计值变小不是流量减少
-		} else { // 旧版本的状态文件（只有合计值）：升级后的第一次仍按合计值算
-			s.RX += delta(rawRX, s.LastRX)
-			s.TX += delta(rawTX, s.LastTX)
+			// 上次读数之后才出现的网卡（含读数抖动后重新出现的）：这次只记下基线，不把它的累计值当作新增流量，
+			// 和 Komari Agent 一致（lastCounters 里没有的网卡首次采样不记录）。
 		}
+		// 上次有、这次没有的网卡直接忽略：它的流量已经累计过了，合计值变小不是流量减少
 	}
 	s.LastRX, s.LastTX, s.Init = rawRX, rawTX, true
 	s.Ifs = make(map[string]ifCounters, len(ifs))
@@ -281,7 +275,7 @@ func daysIn(y int, m time.Month, loc *time.Location) int {
 
 // periodKey 返回 now 所在统计周期的起点。rule.Day 为 0 表示不按月重置；
 // 重置日大于当月天数时取当月最后一天（例如 31 日在 2 月取 28 日或 29 日）。
-// 重置时刻是 0:00 时返回 2006-01-02 格式（与旧版本一致，升级时不会误清零），否则返回 2006-01-02T15:04。
+// 重置时刻是 0:00 时返回 2006-01-02 格式，否则返回 2006-01-02T15:04。
 // 服务端有一份算法相同的实现（periodStart），两边的结果必须一致。
 func periodKey(now time.Time, rule resetRule) string {
 	if rule.Day <= 0 {

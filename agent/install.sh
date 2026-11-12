@@ -10,6 +10,7 @@
 # 卸载：在上面任意一条命令的 sh -s -- 后面改成 --uninstall
 # 支持 systemd（Debian、Ubuntu、Armbian 等）和 OpenRC（Alpine）。Alpine 会自动补装 curl、ca-certificates、tzdata。
 # 指定版本：加参数 -v v1.0.0（默认安装最新的 Release）
+# 完整性校验：默认必须通过 SHA256SUMS 校验，拿不到校验文件或没有 sha256sum 时会中止；确实需要跳过时加参数 --skip-verify
 set -eu
 
 REPO="__REPO__"
@@ -27,6 +28,7 @@ ID=""
 SECRET=""
 URL=""
 TAG=latest
+SKIP_VERIFY=0
 while [ $# -gt 0 ]; do
   case "$1" in
     -i) [ $# -ge 2 ] || die "-i 后面需要节点 ID"; ID="$2"; shift 2 ;;
@@ -34,6 +36,7 @@ while [ $# -gt 0 ]; do
     -u) [ $# -ge 2 ] || die "-u 后面需要上报地址"; URL="$2"; shift 2 ;;
     -v) [ $# -ge 2 ] || die "-v 后面需要版本号，例如 v0.1.0"; TAG="$2"; shift 2 ;;
     --uninstall) ACTION=uninstall; shift ;;
+    --skip-verify) SKIP_VERIFY=1; shift ;;
     *) die "不认识的参数: $1" ;;
   esac
 done
@@ -58,7 +61,7 @@ if [ "$ACTION" = uninstall ]; then
     rc-update del cfsm-lite-agent default >/dev/null 2>&1 || true
   fi
   rm -f "$UNIT" "$RC_FILE" "$RC_LOG" "$BIN"
-  rm -rf "$ENV_DIR" /var/lib/private/cfsm-lite /var/lib/cfsm-lite
+  rm -rf "$ENV_DIR"
   if command -v userdel >/dev/null 2>&1; then userdel cfsm-lite >/dev/null 2>&1 || true
   elif command -v deluser >/dev/null 2>&1; then deluser cfsm-lite >/dev/null 2>&1 || true
   fi
@@ -116,11 +119,14 @@ trap 'rm -rf "$TMP"' EXIT
 echo "下载 $NAME ..."
 curl -fsSL $CURL_OPTS --max-time 300 "$BASE/$NAME" -o "$TMP/$NAME" || die "下载失败: $BASE/$NAME（请确认仓库 $REPO 已发布 Release，并且包含 $ARCH 版本）"
 GOT="$NAME"
-if command -v sha256sum >/dev/null 2>&1 && curl -fsSL $CURL_OPTS --max-time 60 "$BASE/SHA256SUMS" -o "$TMP/SHA256SUMS" 2>/dev/null; then
+# 完整性校验默认必须通过：缺少 sha256sum、下载不到 SHA256SUMS、或校验不一致，都中止安装（不会装一个没校验过的程序）
+if [ "$SKIP_VERIFY" = 1 ]; then
+  echo "警告: 已按 --skip-verify 跳过完整性校验" >&2
+else
+  command -v sha256sum >/dev/null 2>&1 || die "缺少 sha256sum，无法校验文件完整性（请先安装 coreutils，或确认风险后加参数 --skip-verify 跳过校验）"
+  curl -fsSL $CURL_OPTS --max-time 60 "$BASE/SHA256SUMS" -o "$TMP/SHA256SUMS" 2>/dev/null || die "下载校验文件失败: $BASE/SHA256SUMS（请确认 Release 里有 SHA256SUMS；确认风险后可加参数 --skip-verify 跳过校验）"
   (cd "$TMP" && grep " $GOT\$" SHA256SUMS | sha256sum -c - >/dev/null) || die "文件校验失败，可能下载损坏或被篡改，已中止"
   echo "校验通过"
-else
-  echo "警告: 无法校验文件完整性（缺少 sha256sum 或 SHA256SUMS）" >&2
 fi
 
 mkdir -p "$(dirname "$BIN")"
@@ -158,16 +164,7 @@ umask 077
 mkdir -p "$ENV_DIR"
 chmod 755 "$ENV_DIR"
 chown cfsm-lite "$ENV_DIR"
-# 从旧版本的位置迁移状态文件，已累计的当月流量不丢（新位置已有文件时不覆盖）
 STATE="$ENV_DIR/state.json"
-if [ ! -f "$STATE" ]; then
-  for old in /var/lib/private/cfsm-lite/state.json /var/lib/cfsm-lite/state.json; do
-    if [ -f "$old" ]; then
-      cp "$old" "$STATE" && echo "已把旧状态文件迁移到 $STATE" || echo "警告: 迁移旧状态文件失败，当月流量将从安装时重新累计" >&2
-      break
-    fi
-  done
-fi
 [ ! -f "$STATE" ] || { chown cfsm-lite "$STATE"; chmod 600 "$STATE"; }
 cat > "$ENV_FILE" <<EOT
 CFSM_URL=$URL

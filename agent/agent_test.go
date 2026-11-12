@@ -130,12 +130,12 @@ func TestOSAndCPU(t *testing.T) {
 
 func TestParseConfig(t *testing.T) {
 	cur := defaultConfig()
-	body := "collect_interval=0&report_interval=120&reset_day=15&schema_version=6&custom_ct=example.com:443&custom_cu=1.1.1.1&custom_cm=gd-cm.example.com&custom_bd=ip.example.com&interface=eth0,ens3&connection_mode=http&wss_report_interval=2&ping_mode=icmp"
+	body := "report_interval=120&reset_day=15&schema_version=7&custom_ct=example.com:443&custom_cu=1.1.1.1&custom_cm=gd-cm.example.com&custom_bd=ip.example.com&interface=eth0,ens3&connection_mode=http&wss_report_interval=2"
 	next, err := parseConfig(body, cur)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if next.ReportInterval != 120*time.Second || next.ResetDay != 15 || next.Interface != "eth0,ens3" || next.PingMode != "icmp" {
+	if next.ReportInterval != 120*time.Second || next.ResetDay != 15 || next.Interface != "eth0,ens3" {
 		t.Fatalf("unexpected: %+v", next)
 	}
 	if next.Targets["ct"] != "example.com:443" || next.Targets["cu"] != "1.1.1.1" {
@@ -144,10 +144,13 @@ func TestParseConfig(t *testing.T) {
 	if cur.Targets["ct"] == "example.com:443" {
 		t.Fatal("parseConfig must not modify the original config")
 	}
+	// 已经不再使用的键（collect_interval、ping_mode）即使出现也直接忽略，不报错
+	if _, err := parseConfig("report_interval=60&collect_interval=5&ping_mode=icmp", cur); err != nil {
+		t.Fatalf("多余的键应被忽略: %v", err)
+	}
 	for _, bad := range []string{
 		"report_interval=45",
 		"reset_day=40",
-		"ping_mode=udp",
 		"custom_ct=bad host",
 		"interface=eth0;rm",
 		"",
@@ -890,21 +893,6 @@ func TestStateAdvanceIgnoresEmptyReading(t *testing.T) {
 	}
 }
 
-// 旧版本的状态文件只有合计值：升级后的第一次累计按合计值算，不丢也不多算，之后自动带上每块网卡的读数。
-func TestStateAdvanceMigratesOldState(t *testing.T) {
-	rule := resetRule{Day: 1}
-	t0 := time.Date(2026, 10, 10, 12, 0, 0, 0, time.UTC)
-	s := &state{Period: "2026-10-01", RX: 1000, TX: 2000, LastRX: 5000, LastTX: 6000, Init: true}
-	s.advance(one(5400, 6300), t0, rule, "")
-	if s.RX != 1400 || s.TX != 2300 || len(s.Ifs) != 1 {
-		t.Fatalf("migration: %+v", s)
-	}
-	s.advance(one(5500, 6400), t0.Add(time.Minute), rule, "")
-	if s.RX != 1500 || s.TX != 2400 {
-		t.Fatalf("after migration: %+v", s)
-	}
-}
-
 func TestParseNetDevIfaces(t *testing.T) {
 	got := parseNetDevIfaces(netDevSample, map[string]bool{})
 	if len(got) != 2 || got["eth0"] != (ifCounters{RX: 1000, TX: 2000}) || got["ens3"] != (ifCounters{RX: 300, TX: 400}) {
@@ -912,15 +900,16 @@ func TestParseNetDevIfaces(t *testing.T) {
 	}
 }
 
-// 自动汇总排除的网卡前缀和 Komari Agent 一致：桥接、tap、Proxmox 的 vmbr/fwbr/fwpr、podman 等都不算，否则同一份流量会被重复计数。
+// 自动汇总排除的网卡前缀和 Komari Agent 一致（另加 kube、cali、vnet 和 VPN 隧道 tun、wg、tailscale、zt）：桥接、tap、libvirt 的 vnet、Proxmox 的 vmbr/fwbr/fwpr、podman、VPN 隧道等都不算，否则同一份流量会被重复计数。
 func TestIfaceExcludedMatchesKomari(t *testing.T) {
 	for _, n := range []string{"lo", "br0", "br-1a2b3c", "bridge0", "cni0", "docker0", "podman0", "flannel.1", "veth1a",
-		"virbr0", "vmbr0", "tap100i0", "fwbr100i0", "fwpr100p0", "kube-ipvs0", "cali1234"} {
+		"virbr0", "vnet0", "vnet12", "vmbr0", "tap100i0", "fwbr100i0", "fwpr100p0", "kube-ipvs0", "cali1234",
+		"tun0", "wg0", "wg-quick0", "tailscale0", "zt5u4abcde"} {
 		if !ifaceExcluded(n) {
 			t.Errorf("%s 应该被排除", n)
 		}
 	}
-	for _, n := range []string{"eth0", "ens3", "enp1s0", "eno1", "wlan0", "wg0", "tailscale0", "tun0", "ppp0"} {
+	for _, n := range []string{"eth0", "ens3", "enp1s0", "eno1", "wlan0", "enx001122334455", "ppp0"} {
 		if ifaceExcluded(n) {
 			t.Errorf("%s 不应该被排除", n)
 		}
@@ -953,6 +942,18 @@ func TestIfaceWhitelistWildcard(t *testing.T) {
 	}
 	if rx, tx := parseNetDev(sample, splitIfaces("ens3, vmbr0")); rx != 12 || tx != 14 {
 		t.Fatalf("explicit: rx=%d tx=%d", rx, tx)
+	}
+	// 真正的出口就是隧道网卡时，明确写出它的名字就能统计（不受自动排除规则限制）
+	const tunnel = `Inter-|   Receive                                                |  Transmit
+ face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed
+  eth0: 100 0 0 0 0 0 0 0 200 0 0 0 0 0 0 0
+   wg0: 30 0 0 0 0 0 0 0 40 0 0 0 0 0 0 0
+`
+	if rx, tx := parseNetDev(tunnel, map[string]bool{}); rx != 100 || tx != 200 {
+		t.Fatalf("自动汇总不应包含隧道网卡: rx=%d tx=%d", rx, tx)
+	}
+	if rx, tx := parseNetDev(tunnel, splitIfaces("wg0")); rx != 30 || tx != 40 {
+		t.Fatalf("明确写出 wg0 应能统计: rx=%d tx=%d", rx, tx)
 	}
 }
 

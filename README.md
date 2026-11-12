@@ -19,6 +19,7 @@ CFSM Lite 的服务器探针（Agent）。装在每台被监控的 Linux 服务�
 9. [常见问题与排错](#9-常见问题与排错)
 10. [验证状态与已知限制](#10-验证状态与已知限制)
 11. [项目结构与开发](#11-项目结构与开发)
+12. [Alpine 与 Armbian 说明](#12-alpine-与-armbian-说明)
 
 ---
 
@@ -128,11 +129,11 @@ curl -fsSL https://raw.githubusercontent.com/用户名/CFSM-Lite-Agent/main/inst
 ### 4.4 脚本做了什么
 
 1. 检查是 root、服务管理器是 systemd 或 OpenRC（Alpine）、有 curl（Alpine 上缺少 `curl`、`ca-certificates` 时自动补装）、参数齐全、上报地址以 `https://` 开头。
-2. 根据 CPU 架构下载对应的程序，同时下载 `SHA256SUMS` 校验文件并核对；校验失败就中止（拿不到校验文件时会提示警告并继续）。下载只走 HTTPS（重定向也一样）、至少 TLS 1.2，网络抖动时自动重试 3 次，连接超过 10 秒、程序下载超过 300 秒（校验文件 60 秒）会放弃，不会一直卡住。
+2. 根据 CPU 架构下载对应的程序，同时下载 `SHA256SUMS` 校验文件并核对；校验失败、下载不到校验文件、或系统里没有 `sha256sum`，都会中止安装（不会装一个没校验过的程序）。确认风险后确实需要跳过时，在命令的 `sh -s --` 后面加参数 `--skip-verify`。下载只走 HTTPS（重定向也一样）、至少 TLS 1.2，网络抖动时自动重试 3 次，连接超过 10 秒、程序下载超过 300 秒（校验文件 60 秒）会放弃，不会一直卡住。
 3. 把程序放到 `/opt/cfsm-lite/cfsm-lite-agent`。
 4. 把上报地址、节点 ID、密钥写入 `/opt/cfsm-lite/agent.env`，文件权限 600，只有 root 能读。
 5. 创建服务 `cfsm-lite-agent` 并启动：systemd 系统是 `/etc/systemd/system/cfsm-lite-agent.service`；Alpine 是 OpenRC 脚本 `/etc/init.d/cfsm-lite-agent`（用 supervise-daemon 守护，异常退出 10 秒后重启，日志写到 `/var/log/cfsm-lite-agent.log`，超过 5MB 时在下次启动时清空；Alpine 上无法使用下面 systemd 的沙箱保护项）。两种系统的程序、`agent.env`、`state.json` 路径完全相同，创建的服务用户也都是 `cfsm-lite`。下面的描述以 systemd 为准：服务以专门创建的低权限系统用户 `cfsm-lite` 运行（只能写 `/opt/cfsm-lite` 这一个目录），并开启这些保护：`ReadWritePaths` 只开放该目录、`NoNewPrivileges`、`ProtectSystem=strict`、`ProtectHome=read-only`、`PrivateTmp`、不授予任何额外权限（`CapabilityBoundingSet` 为空）；以及一组扩展加固：`PrivateDevices`、`ProtectKernelTunables`、`ProtectKernelModules`、`ProtectKernelLogs`、`ProtectControlGroups`、`ProtectClock`、`ProtectHostname`、`RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX`（只允许 IPv4、IPv6 和本地套接字）、`RestrictNamespaces`、`RestrictRealtime`、`RestrictSUIDSGID`、`LockPersonality`、`SystemCallArchitectures=native`、`UMask=0077`，并限制内存 `MemoryMax=128M` 和线程数 `TasksMax=128`（`systemd-analyze security` 的评分从 5.9 降到 3.1）。扩展加固刻意没有包含 `ProtectProc=invisible`，它会让「进程数」只统计到 Agent 自己。如果个别系统不接受这些扩展项导致服务启动失败，脚本会打印警告，自动退回只含基础保护的服务文件再试一次`ProtectHome` 用只读而不是完全隐藏，是为了让单独挂载在 `/home` 的磁盘也能被统计到。
-6. 当月流量的累计状态保存在 `/opt/cfsm-lite/state.json`（和程序在同一目录；服务以专门的系统用户 `cfsm-lite` 运行，只有这个目录归它所有，程序和 `agent.env` 仍归 root；从旧版本升级时，安装脚本会把旧位置的状态文件迁移过来）。同一个文件里还保存着最近一次从 Worker 收到的配置（重置日、重置时刻、时区、统计网卡等），状态文件先写临时文件并 `fsync`，再改名替换，断电也不会留下空文件或半截文件，并保留一份最多落后约 10 分钟的备份 `state.json.bak`；主文件万一损坏，Agent 会在日志里说明，自动用备份恢复（没有备份才从 0 开始，损坏的文件保留为 `state.json.corrupt`）。所以重启服务或重新执行安装命令升级后，Agent 会先按这份配置接着累计，不会因为尚未连上 Worker 而用默认值把当月流量清零。
+6. 当月流量的累计状态保存在 `/opt/cfsm-lite/state.json`（和程序在同一目录；服务以专门的系统用户 `cfsm-lite` 运行，只有这个目录归它所有，程序和 `agent.env` 仍归 root）。同一个文件里还保存着最近一次从 Worker 收到的配置（重置日、重置时刻、时区、统计网卡等），状态文件先写临时文件并 `fsync`，再改名替换，断电也不会留下空文件或半截文件，并保留一份最多落后约 10 分钟的备份 `state.json.bak`；主文件万一损坏，Agent 会在日志里说明，自动用备份恢复（没有备份才从 0 开始，损坏的文件保留为 `state.json.corrupt`）。所以重启服务或重新执行安装命令升级后，Agent 会先按这份配置接着累计，不会因为尚未连上 Worker 而用默认值把当月流量清零。
 
 ### 4.5 日常管理
 
@@ -164,7 +165,6 @@ Agent 本地只有三项必需配置：上报地址、节点 ID、上报密钥�
 | `timezone` | IANA 时区名，如 `Asia/Shanghai` | 重置时刻使用的时区，由服务端「系统」页统一设置，默认上海；程序内嵌了时区数据库，不依赖服务器自带的 tzdata |
 | `cal_id`、`cal_rx`、`cal_tx`、`cal_period` | 数字、字节数、周期标识 | 手动校准：把本期下行、上行累计直接改成填写的数值，同一个 `cal_id` 只应用一次，校准所属周期已过则忽略 |
 | `interface` | 网卡名，多个用逗号分隔，留空表示自动汇总 | 统计流量的网卡 |
-| `ping_mode` | `tcp` 或 `icmp` | 探测方式；Lite Agent 只支持 tcp，icmp 会自动改用 tcp |
 | `custom_ct`、`custom_cu`、`custom_cm`、`custom_bd` | `主机` 或 `主机:端口` | 四个 Ping 目标 |
 | `connection_mode` | `auto` 或 `http` | `auto`：保持实时连接；`http`：只用 HTTP POST |
 | `wss_report_interval` | 1 到 5（秒） | 实时推送的间隔（最终以服务端通知的为准），默认 2 |
@@ -217,7 +217,7 @@ Agent 本地只有三项必需配置：上报地址、节点 ID、上报密钥�
   - **根目录 `/` 始终统计**（和 Komari 一致）：LXC 等容器的根文件系统可能是 loop 设备、ZFS 子卷或 overlay，不在上面的规则里，不算的话磁盘会显示成 0；旧内核可能先列出一行 `rootfs`，只取最后一个 `/`；
   - 如果一个都没识别出来，退回到只统计根目录；
   - **卡死保护**：每个挂载点的用量读取都有 3 秒超时。个别挂载卡死（例如 ntfs-3g 进程挂掉、磁盘故障）时，这个挂载点暂时沿用上一次的数值并在日志里提示（每分钟最多一条），不会再拖住上报和实时推送，也不影响其他磁盘；它恢复后自动回到正常读数。
-- **流量**：读取 `/proc/net/dev`。默认汇总所有网卡，排除 `lo`、`br`、`cni`、`docker`、`podman`、`flannel`、`veth`、`virbr`、`vmbr`、`tap`、`fwbr`、`fwpr`（与 Komari Agent 一致）以及 `kube`、`cali` 开头的虚拟网卡——这些网卡上的流量会从物理网卡再走一遍，算进去就是重复计数；可由「统计网卡」指定，支持 `*`、`?` 通配符（例如 `eth*`），明确写出的网卡不受上述排除限制。
+- **流量**：读取 `/proc/net/dev`。默认汇总所有网卡，排除 `lo`、`br`、`cni`、`docker`、`podman`、`flannel`、`veth`、`virbr`、`vmbr`、`tap`、`fwbr`、`fwpr`（与 Komari Agent 一致）以及 `kube`、`cali`、`vnet`、`tun`、`wg`、`tailscale`、`zt` 开头的虚拟网卡（`vnet` 是 libvirt/KVM 给每台虚拟机创建的网卡；`tun`、`wg`、`tailscale`、`zt` 是 OpenVPN、WireGuard、Tailscale、ZeroTier 的 VPN 隧道网卡）——这些网卡上的流量会从物理网卡再走一遍，算进去就是重复计数；可由「统计网卡」指定，支持 `*`、`?` 通配符（例如 `eth*`），明确写出的网卡不受上述排除限制。**如果这台服务器真正的出口就是隧道网卡**（例如全部流量都走 WireGuard），请在服务端节点编辑的「统计网卡」里明确写出它的名字（如 `wg0`），否则自动汇总会漏算这部分流量。
   - 累计上下行（`net_rx`、`net_tx`）是网卡计数器的原始值；
   - 实时网速由两次读数的差值除以间隔得到，计数器回绕或网卡重置时按 0 处理，不会出现负数；
   - **当月流量**由 Agent 按「每月流量重置日」累计，保存在 `/opt/cfsm-lite/state.json`，重启或重新执行安装命令升级后接着累计（累计状态每 30 秒和退出时落盘）；Agent 停止运行期间产生的流量，会在下次启动时补上（计数器没有被重置的话）。**累计算法与 Komari Agent 对齐**：按网卡分别算两次读数的差值再相加；某块网卡的计数器变小（重启、网卡重建、读数异常）时这一段按 0 处理并重建基线，新出现的网卡首次读数也只建基线，都不会把整个计数器当作新增流量。**从安装那一刻开始累计，不包含安装之前的流量**。重置日大于当月天数时取当月最后一天；统计周期按服务端设置的时区（默认 `Asia/Shanghai`）和重置时刻（默认 0 点 0 分）划分，与服务器本机时区无关；更换统计网卡会重新建立基线；修改重置日、重置时刻后当前周期的累计会从 0 重新开始，需要的话可以在服务端用「手动校准」补回。
@@ -293,7 +293,6 @@ Agent 本地只有三项必需配置：上报地址、节点 ID、上报密钥�
 | `上报失败（连续第 N 次）…` 后面是网络错误 | 服务器连不上 Worker 的域名：检查 DNS、防火墙；大陆服务器请换成自己的域名 |
 | `实时推送连接断开：WebSocket 握手失败：HTTP 503` | 服务端没有启用实时推送（Worker 没绑定 Durable Object），这不影响 HTTP 上报；按服务端 README 用 GitHub 连接部署 |
 | `实时推送连接断开：WebSocket 握手失败：HTTP 403` | 这个节点的连接模式被设成了「仅 HTTP POST」，改回「自动」即可 |
-| `提示：Lite Agent 只支持 TCP 探测，已自动使用 TCP` | 在管理页把探测方式选成了 ICMP，Lite Agent 不支持，已自动改用 TCP，无需处理 |
 | `忽略无效的配置: …` | 服务端下发的配置里有不合法的值，Agent 保持原配置；检查管理页里该节点的设置 |
 | `状态文件 … 损坏（…），尝试从备份恢复` | 状态文件被断电等原因损坏。日志下一行会说明是从备份恢复（最近一小段流量累计可能丢失），还是没有备份、从 0 重新累计；损坏的文件保留为 `state.json.corrupt`，可以删除 |
 | `读取磁盘 /xxx 的用量超过 3s 没有返回` | 这个挂载点卡死了（FUSE 进程挂掉、磁盘故障等），Agent 暂时沿用它上一次的数值，其他指标和上报不受影响；请检查该磁盘或挂载 |
@@ -321,9 +320,9 @@ Agent 本地只有三项必需配置：上报地址、节点 ID、上报密钥�
 - 只支持 Linux（amd64 和 arm64）以及 systemd 或 OpenRC；32 位 ARM（armv7、armhf）不支持，安装脚本会直接提示不支持的架构。
 - 不支持 ICMP 探测，只有 TCP。
 - 不保存历史数据，也没有历史曲线。
-- 自己的实时推送协议和原版 CF-Server-Monitor 的 cfsm-agent **不通用**；原版 Agent 不能连接本项目的实时通道。
+- **不兼容原版 CF-Server-Monitor 的 cfsm-agent**：上报格式、配置下发和实时推送协议都是本项目自己的，原版 Agent 不能连接本项目的服务端。
 - 磁盘只统计本地磁盘和 ZFS 存储池（根目录始终统计）；网络挂载一律不计入；ZFS 为近似值。
-- 当月流量从安装时开始累计；与服务商面板有出入时，用服务端节点编辑里的「手动校准当期流量」修正（需要 Agent 升级到支持配置 schema 7 的版本）。校准按「Agent 下次上报时」生效，期间产生的少量流量会算进去。
+- 当月流量从安装时开始累计；与服务商面板有出入时，用服务端节点编辑里的「手动校准当期流量」修正。校准按「Agent 下次上报时」生效，期间产生的少量流量会算进去。
 - 服务端的「采集间隔」设置目前不起作用（Lite 不保存历史样本）。
 
 ---
@@ -352,16 +351,22 @@ CFSM-Lite-Agent/
 ├── realtime_test.go      WebSocket 与实时会话的单元测试
 ├── hardening_test.go     状态文件恢复、磁盘卡死保护、连接数统计、重连抖动的单元测试
 └── .github/workflows/
-    ├── ci.yml            每次提交：静态检查、单元测试、两个架构的编译检查
+    ├── ci.yml            每次提交：静态检查、单元测试（含竞态检测）、两个架构的编译检查
     └── release.yml       发布 Release 时：编译两个架构、生成校验文件并上传
 ```
 
 - 修改代码后提交，等 `ci` 通过；需要发新版本时再发布一个 Release（见 3.4）。
-- **`install.sh` 在服务端 CFSM-Lite 仓库的 `src/index.js` 里还有一份拷贝**（常量 `INSTALL_SH`），修改本仓库的 `install.sh` 后，要把同样的内容同步过去。脚本里 `REPO="__REPO__"` 这一行是占位符，保持不变：服务端返回脚本时会把它替换成 `AGENT_REPO` 的值，直接使用本仓库脚本时则读取环境变量 `CFSM_AGENT_REPO`。
-- 本地开发（可选，需要 Go 1.21 或更新版本）：`go vet ./...`、`go test ./...`。
+- **`install.sh` 在服务端 CFSM-Lite 仓库的 `src/index.js` 里还有一份拷贝**（常量 `INSTALL_SH`），修改本仓库的 `install.sh` 后，要把同样的内容同步过去，同步后在 `agent` 文件夹里用下面的命令核对两份是否一致（`你的Worker域名` 换成实际域名；它把服务端返回内容里被替换过的 `REPO=` 一行还原后，和本地文件逐行比较）：
+
+  ```sh
+  curl -fsSL https://你的Worker域名/install.sh | sed 's#^REPO=.*#REPO="__REPO__"#' | diff - install.sh && echo 一致
+  ```
+
+  输出「一致」就说明两份相同；有差异时会列出不同的行。脚本里 `REPO="__REPO__"` 这一行是占位符，保持不变：服务端返回脚本时会把它替换成 `AGENT_REPO` 的值，直接使用本仓库脚本时则读取环境变量 `CFSM_AGENT_REPO`。
+- 本地开发（可选，需要 Go 1.21 或更新版本）：`go vet ./...`、`go test ./...`（加 `-race` 做竞态检测需要本机有 C 编译器）。
 - 程序的版本号在编译时由 `release.yml` 注入（等于 Release 的 Tag）；本地直接编译得到的版本号是 `dev`。
 
-## 11. Alpine 与 Armbian 说明
+## 12. Alpine 与 Armbian 说明
 
 - **静态编译**：所有 Release 文件都用 `CGO_ENABLED=0` 编译，不依赖 glibc，Alpine（musl）直接能运行；时区数据库也编进了程序（`time/tzdata`），Alpine 没装 `tzdata` 也不影响。新增依赖时不要引入需要 CGO 的库，否则 Alpine 上会出现 `not found`。安装脚本会在启动服务前试运行一次下载的程序，无法执行时（退出码 126 / 127）直接中止并提示。
 - **Armbian**：只支持 64 位（`uname -m` 为 `aarch64`，用 arm64 版本）；32 位系统（`armv7l`、`armv8l`）不支持。ARM 的 `/proc/cpuinfo` 没有 `model name`，CPU 型号依次取 `Hardware`、`Processor`、`Model`，都没有时读设备树 `/proc/device-tree/model`（例如 `Orange Pi 5`）。

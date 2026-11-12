@@ -121,11 +121,15 @@ func parseMeminfo(text string) memInfo {
 
 // excludedIfacePrefixes 是自动汇总时不计入流量的网卡名前缀，和 Komari Agent 的 loopbackNames 保持一致：
 // 这些网卡（回环、容器、虚拟网桥、虚拟机的 tap 口等）上的流量，要么本来就会从物理网卡再走一遍（算进去就是重复计数，
-// 例如 Proxmox 的 vmbr0 + 物理网卡、KVM 的 br0 + vnet/tap），要么根本不出本机。
-// 前缀匹配，所以 "br" 会同时排除 br0、br-xxxx、bridge0。kube、cali 是本项目额外保留的（Kubernetes 的虚拟网卡，同样会重复计数）。
+// 例如 Proxmox 的 vmbr0 + 物理网卡、KVM 的 br0 + tap 口），要么根本不出本机。
+// 前缀匹配，所以 "br" 会同时排除 br0、br-xxxx、bridge0。kube、cali、vnet、tun、wg、tailscale、zt 是本项目额外保留的：
+// kube、cali 是 Kubernetes 的虚拟网卡；vnet 是 libvirt（KVM）给每台虚拟机创建的网卡（vnet0、vnet1……）；
+// tun（OpenVPN 等）、wg（WireGuard）、tailscale、zt（ZeroTier）是 VPN 隧道网卡——隧道里的流量会被封装后再经过物理网卡，
+// 两边都算就是重复计数。这些都会让同一份流量重复计数。
+// 如果这台服务器真正的出口就是隧道网卡，在管理页「统计网卡」里明确写出它的名字即可：明确写出的网卡不受这个排除规则限制。
 var excludedIfacePrefixes = []string{
 	"lo", "br", "cni", "docker", "podman", "flannel", "veth", "virbr", "vmbr", "tap", "fwbr", "fwpr",
-	"kube", "cali",
+	"kube", "cali", "vnet", "tun", "wg", "tailscale", "zt",
 }
 
 // ifaceExcluded 判断网卡是否属于回环或容器、虚拟网桥（自动汇总时不计入流量）。

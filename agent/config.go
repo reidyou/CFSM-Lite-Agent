@@ -24,7 +24,6 @@ type config struct {
 	CalRX, CalTX   uint64         // 手动校准的本期下行、上行字节数
 	CalPeriod      string         // 校准所属的统计周期；周期已经过去的校准不再应用
 	Interface      string
-	PingMode       string
 	ConnMode       string            // auto：有人在看时实时推送，其余时间 HTTP POST；http：只用 HTTP POST
 	WSSInterval    time.Duration     // 实时推送的间隔（1 到 5 秒）；实际以服务端通知的为准
 	Targets        map[string]string // ct、cu、cm、bd 四个探测目标
@@ -54,7 +53,6 @@ func defaultConfig() config {
 		ResetDay:       1,
 		TZName:         defaultTZ,
 		Loc:            loadZone(defaultTZ),
-		PingMode:       "tcp",
 		ConnMode:       "auto",
 		WSSInterval:    2 * time.Second,
 		Targets: map[string]string{
@@ -80,7 +78,8 @@ func md5Hex(s string) string {
 }
 
 // parseConfig 解析 Worker 下发的 QueryParam 配置串（例如 report_interval=60&reset_day=1&...）。
-// 只认下面列出的键，其余（connection_mode、wss_report_interval、schema_version 等）一律忽略。
+// 只认下面列出的键：report_interval、reset_day、reset_hour、reset_minute、timezone、cal_*（流量校准）、interface、
+// connection_mode、wss_report_interval 和 custom_*（Ping 目标）；其余（schema_version 等）一律忽略。Ping 固定用 TCP，不需要配置。
 // 任何一项不合法就整体拒绝并保持当前配置，避免半套用。
 func parseConfig(body string, cur config) (config, error) {
 	body = strings.TrimSpace(body)
@@ -151,12 +150,6 @@ func parseConfig(body string, cur config) (config, error) {
 			return cur, fmt.Errorf("interface 无效: %q", v)
 		}
 		next.Interface = v
-	}
-	if v := q.Get("ping_mode"); v != "" {
-		if v != "tcp" && v != "icmp" {
-			return cur, fmt.Errorf("ping_mode 无效: %q", v)
-		}
-		next.PingMode = v
 	}
 	if v := q.Get("connection_mode"); v != "" {
 		if v != "auto" && v != "http" {

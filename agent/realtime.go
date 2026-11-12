@@ -100,8 +100,9 @@ func runRealtime(ctx context.Context, s settings, box *cfgBox, st *state, sh *sh
 		} else if backoff < rtMaxBackoff {
 			backoff *= 2
 		}
+		wait = rtJitter(wait) // ±20% 随机量：Worker 重新部署后所有节点不会在同一时刻一起重连
 		if time.Since(lastLog) > time.Minute {
-			log.Printf("实时推送连接断开：%v，%s 后重试（HTTP 上报不受影响）", err, wait)
+			log.Printf("实时推送连接断开：%v，%s 后重试（HTTP 上报不受影响）", err, wait.Round(time.Second))
 			lastLog = time.Now()
 		}
 		if !sleepCtx(ctx, wait) {

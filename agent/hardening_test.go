@@ -268,3 +268,15 @@ func TestRtJitterRange(t *testing.T) {
 		t.Fatalf("抖动几乎没有随机性: 最小 %s 最大 %s", lo, hi)
 	}
 }
+
+// 回归保护：rtJitter 曾经只有定义和单元测试、生产代码里没有任何地方调用，重连等待实际没有随机量。
+// 这里直接检查 runRealtime 的源码里确实把等待时间交给了 rtJitter。
+func TestRealtimeRetryAppliesJitter(t *testing.T) {
+	src, err := os.ReadFile("realtime.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(src), "wait = rtJitter(wait)") {
+		t.Fatal("runRealtime 的重连等待没有应用 rtJitter")
+	}
+}

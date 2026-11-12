@@ -172,7 +172,7 @@ func readHeavy() map[string]any {
 // 组成一份完整的指标。Worker 和推送中心都按「完整指标」处理，所以实时帧也必须带上所有字段。
 func buildMetrics(a, b snapshot, cfg config, st *state, heavy, ping map[string]any) map[string]any {
 	secs := b.at.Sub(a.at).Seconds()
-	// 还没拿到服务端配置（首次启动、或旧版本升级后状态文件里还没有保存配置）时只读取、不累计：
+	// 还没拿到服务端配置（首次启动、或状态文件里还没有保存配置）时只读取、不累计：
 	// 默认配置的重置日、时区、网卡可能和服务端不同，用它累计会清零或重建基线。
 	// 等配置同步后，下一次累计会把这段时间内网卡计数器的增量一并补上。
 	skew := clk.get()

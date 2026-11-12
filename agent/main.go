@@ -112,7 +112,6 @@ func run(ctx context.Context, s settings) {
 	rep := newReporter(s)
 	rep.syncClock(ctx) // 先校准本机时钟差，第一份指标的开机时间才是准的
 	cfgMD5 := "none"
-	warnedICMP := false
 	failures := 0
 
 	// 实时推送：平时只保持一条空闲连接，有人在看时才高频推送；它失败不影响下面的 HTTP 上报
@@ -166,10 +165,6 @@ func run(ctx context.Context, s settings) {
 			log.Printf("服务端返回 HTTP %d", res.Status)
 		}
 
-		if cfg.PingMode == "icmp" && !warnedICMP {
-			log.Printf("提示：Lite Agent 只支持 TCP 探测，已自动使用 TCP")
-			warnedICMP = true
-		}
 		if s.Debug {
 			log.Printf("本轮 cpu=%v ping_ct=%v loss_ct=%v 月流量下行=%v", metrics["cpu"], metrics["ping_ct"], metrics["loss_ct"], metrics["net_rx_monthly"])
 		}
