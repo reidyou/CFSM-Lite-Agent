@@ -71,13 +71,13 @@ Agent ──① 每个上报间隔 HTTP POST /update（带完整指标；响应�
 ### 3.1 创建公开仓库并上传文件
 
 1. 在 GitHub 新建仓库，名称 **`CFSM-Lite-Agent`**，选择 **Public（公开）**。
-2. 把本项目压缩包解压，在仓库页面点 Add file → Upload files，把解压出来的文件拖进去（不是拖压缩包本身）：`README.md`、`go.mod`、`install.sh`，以及所有 `.go` 文件，提交。
+2. 把本项目压缩包解压，在仓库页面点 Add file → Upload files，把解压出来的 `README.md` 和 **`agent` 文件夹**（里面是 `go.mod`、`install.sh` 和所有 `.go` 文件）拖进去（不是拖压缩包本身），提交。
 3. 文件夹 `.github` 在 Mac 的访达里默认是隐藏的，不容易拖。改用网页创建：点 Add file → Create new file，文件名输入 `.github/workflows/ci.yml`（输入斜杠会自动建文件夹），把压缩包里同名文件的内容粘贴进去，提交；再用同样的方法建 `.github/workflows/release.yml`。
 
 ### 3.2 确认自动编译通过
 
 1. 打开仓库的 Actions 页，应该能看到名为 `ci` 的任务自动运行。它会做静态检查、运行单元测试，并对 amd64 和 arm64 各编译一次（测试带 `-race` 竞态检测）。
-2. 变成绿色表示通过。**这也是代码第一次真正编译**，如果变红，点进去看日志，把报错原文发给我，不要继续往下做。
+2. 变成绿色表示通过。**这也是代码第一次真正编译**，如果变红，点进去看日志，把报错原文复制出来排查，不要继续往下做。
 
 ### 3.3 发布 Release
 
@@ -109,7 +109,7 @@ curl -fsSL https://你的Worker域名/install.sh | sh -s -- -i 节点ID -s 上�
 不经过 Worker，直接从本仓库下载脚本，用环境变量 `CFSM_AGENT_REPO` 指定发布仓库：
 
 ```
-curl -fsSL https://raw.githubusercontent.com/用户名/CFSM-Lite-Agent/main/install.sh | CFSM_AGENT_REPO=用户名/CFSM-Lite-Agent sh -s -- -i 节点ID -s 上报密钥 -u https://你的Worker域名/update
+curl -fsSL https://raw.githubusercontent.com/用户名/CFSM-Lite-Agent/main/agent/install.sh | CFSM_AGENT_REPO=用户名/CFSM-Lite-Agent sh -s -- -i 节点ID -s 上报密钥 -u https://你的Worker域名/update
 ```
 
 ### 4.3 脚本的参数
@@ -167,7 +167,7 @@ Agent 本地只有三项必需配置：上报地址、节点 ID、上报密钥�
 | `interface` | 网卡名，多个用逗号分隔，留空表示自动汇总 | 统计流量的网卡 |
 | `custom_ct`、`custom_cu`、`custom_cm`、`custom_bd` | `主机` 或 `主机:端口` | 四个 Ping 目标 |
 | `connection_mode` | `auto` 或 `http` | `auto`：保持实时连接；`http`：只用 HTTP POST |
-| `wss_report_interval` | 1 到 5（秒） | 实时推送的间隔（最终以服务端通知的为准），默认 2 |
+| `wss_report_interval` | 1 到 5（秒） | 实时推送的间隔（最终以服务端通知的为准），默认 3 |
 
 首次连接时，Agent 使用内置的默认值，随后第一次上报就会拿到服务端的配置。
 
@@ -185,8 +185,8 @@ Agent 本地只有三项必需配置：上报地址、节点 ID、上报密钥�
 1. **连接**：连接模式为「自动」时，Agent 向上报地址发起 WebSocket 升级请求（`GET /update`，请求头 `Authorization: Bearer <上报密钥>`、`X-Agent-Id: <节点ID>`、`X-Agent-Version`）。连不上不影响 HTTP 上报。
 2. **保活**：空闲时每 25 秒发一条文本消息 `ping`，服务端自动回 `pong`；超过 60 秒没收到任何数据就判定连接已死并重连。有人在看（正在推送）时缩短为每 10 秒一次、超过 25 秒没有数据就重连，连接卡死时看盘页面最多停顿几十秒，而不是一分多钟。
 3. **服务端通知 Agent**（文本消息，JSON）：
-   - `{"type":"ready","active":false,"interval":2}`：连接建立时发送，`active` 表示此刻是否已经有人在看。
-   - `{"type":"activate","interval":2}`：有人开始看，Agent 开始实时推送，`interval` 是推送间隔（1 到 5 秒）。已经在推送时再收到同样间隔的 `activate`（服务端发现很久没有收到实时帧时会补发）会被忽略，保持原来的节奏。
+   - `{"type":"ready","active":false,"interval":3}`：连接建立时发送，`active` 表示此刻是否已经有人在看。
+   - `{"type":"activate","interval":3}`：有人开始看，Agent 开始实时推送，`interval` 是推送间隔（1 到 5 秒）。已经在推送时再收到同样间隔的 `activate`（服务端发现很久没有收到实时帧时会补发）会被忽略，保持原来的节奏。
    - `{"type":"deactivate"}`：没人看了，Agent 停止推送。
 4. **Agent 推送**：`{"type":"metrics","metrics":{…完整指标…}}`。每一帧都带完整指标，变化慢的字段（磁盘、负载、进程与连接数、IP 可用性、系统信息）每 10 秒才重新读取一次，其余沿用；Ping 结果是后台持续采样的最新统计值，每一帧都是新的。
 5. **实时数据不写数据库**；数据库仍然每个上报间隔由 HTTP POST 写一次。
@@ -312,7 +312,7 @@ Agent 本地只有三项必需配置：上报地址、节点 ID、上报密钥�
 
 ### 10.1 验证状态
 
-- **编译与测试**：代码已用 Go 1.24 编译，`go vet` 和单元测试（含 `-race` 竞态检测）通过，其中包括状态文件并发保存与损坏恢复、磁盘卡死保护、连接数流式统计与旧实现的逐行对照、重连抖动；安装脚本生成的 systemd 服务文件已用 `systemd-analyze verify` 校验；单元测试覆盖配置解析、`/proc` 文件解析、磁盘挂载筛选、流量累计、Ping、WebSocket 帧收发与握手、完整的实时会话等。上传到 GitHub 后请仍然先确认 `ci` 是绿色的（见 3.2）。**还没有在真实服务器上长期运行过。** 时间校准（`clock.go` 与 `clock_test.go`）这一部分的代码也已用 Go 1.24 编译，单元测试（含 `-race`）通过；仍然请先看 GitHub 上 `ci` 是否变绿（第 3.2 节），变红就把报错原文发出来。扩展加固项和卡死挂载的行为**还没有在真实的 systemd 和故障磁盘上验证过**。
+- **编译与测试**：代码已用 Go 1.24 编译，`go vet` 和单元测试（含 `-race` 竞态检测）通过；测试覆盖配置解析、`/proc` 文件解析、磁盘挂载筛选、流量累计与状态文件并发保存/损坏恢复、磁盘卡死保护、连接数统计、Ping、时间校准、WebSocket 帧收发与握手、完整的实时会话等；安装脚本生成的 systemd 服务文件已用 `systemd-analyze verify` 校验。上传到 GitHub 后请先确认 `ci` 是绿色的（见 3.2）。**还没有在真实服务器上长期运行过**，systemd 加固项和卡死挂载的行为也没有在真实环境和故障磁盘上验证过。
 - 没有在真实的 Cloudflare 服务端和 Monito 上验证过；请按服务端 README 的「首次验证清单」检查。
 
 ### 10.2 已知限制
@@ -323,7 +323,6 @@ Agent 本地只有三项必需配置：上报地址、节点 ID、上报密钥�
 - **不兼容原版 CF-Server-Monitor 的 cfsm-agent**：上报格式、配置下发和实时推送协议都是本项目自己的，原版 Agent 不能连接本项目的服务端。
 - 磁盘只统计本地磁盘和 ZFS 存储池（根目录始终统计）；网络挂载一律不计入；ZFS 为近似值。
 - 当月流量从安装时开始累计；与服务商面板有出入时，用服务端节点编辑里的「手动校准当期流量」修正。校准按「Agent 下次上报时」生效，期间产生的少量流量会算进去。
-- 服务端的「采集间隔」设置目前不起作用（Lite 不保存历史样本）。
 
 ---
 
@@ -332,24 +331,25 @@ Agent 本地只有三项必需配置：上报地址、节点 ID、上报密钥�
 ```
 CFSM-Lite-Agent/
 ├── README.md             本文件
-├── go.mod                Go 模块（只用标准库）
-├── install.sh            安装脚本（也被服务端内嵌了一份拷贝）
-├── main.go               入口：参数解析、HTTP 上报主循环
-├── report.go             HTTP 上报
-├── config.go             配置解析（Worker 下发的配置串）、MD5
-├── collect.go            指标采集：快照、完整指标构造、实时采样
-├── parse.go              /proc 文件解析、磁盘挂载筛选与合计
-├── sys_linux.go          磁盘用量（statfs 系统调用）
-├── diskguard.go          磁盘用量读取的超时保护（挂载卡死时沿用上次数值）
-├── ping.go               TCP 延迟与丢包：后台采样与窗口统计
-├── state.go              当月流量累计与统计周期
-├── clock.go              时间校准：用 HTTP Date 头估算本机时钟偏差
-├── clock_test.go         时间校准的单元测试
-├── realtime.go           实时推送：连接管理、保活、按需推送
-├── wsclient.go           最小的 WebSocket 客户端（只用标准库）
-├── agent_test.go         解析、配置、状态、Ping、上报等的单元测试
-├── realtime_test.go      WebSocket 与实时会话的单元测试
-├── hardening_test.go     状态文件恢复、磁盘卡死保护、连接数统计、重连抖动的单元测试
+├── agent/
+│   ├── go.mod                Go 模块（只用标准库）
+│   ├── install.sh            安装脚本（也被服务端内嵌了一份拷贝）
+│   ├── main.go               入口：参数解析、HTTP 上报主循环
+│   ├── report.go             HTTP 上报
+│   ├── config.go             配置解析（Worker 下发的配置串）、MD5
+│   ├── collect.go            指标采集：快照、完整指标构造、实时采样
+│   ├── parse.go              /proc 文件解析、磁盘挂载筛选与合计
+│   ├── sys_linux.go          磁盘用量（statfs 系统调用）
+│   ├── diskguard.go          磁盘用量读取的超时保护（挂载卡死时沿用上次数值）
+│   ├── ping.go               TCP 延迟与丢包：后台采样与窗口统计
+│   ├── state.go              当月流量累计与统计周期
+│   ├── clock.go              时间校准：用 HTTP Date 头估算本机时钟偏差
+│   ├── clock_test.go         时间校准的单元测试
+│   ├── realtime.go           实时推送：连接管理、保活、按需推送
+│   ├── wsclient.go           最小的 WebSocket 客户端（只用标准库）
+│   ├── agent_test.go         解析、配置、状态、Ping、上报等的单元测试
+│   ├── realtime_test.go      WebSocket 与实时会话的单元测试
+│   └── hardening_test.go     状态文件恢复、磁盘卡死保护、连接数统计、重连抖动的单元测试
 └── .github/workflows/
     ├── ci.yml            每次提交：静态检查、单元测试（含竞态检测）、两个架构的编译检查
     └── release.yml       发布 Release 时：编译两个架构、生成校验文件并上传
@@ -363,7 +363,7 @@ CFSM-Lite-Agent/
   ```
 
   输出「一致」就说明两份相同；有差异时会列出不同的行。脚本里 `REPO="__REPO__"` 这一行是占位符，保持不变：服务端返回脚本时会把它替换成 `AGENT_REPO` 的值，直接使用本仓库脚本时则读取环境变量 `CFSM_AGENT_REPO`。
-- 本地开发（可选，需要 Go 1.21 或更新版本）：`go vet ./...`、`go test ./...`（加 `-race` 做竞态检测需要本机有 C 编译器）。
+- 本地开发（可选，需要 Go 1.21 或更新版本，在 `agent` 文件夹里执行）：`go vet ./...`、`go test ./...`（加 `-race` 做竞态检测需要本机有 C 编译器）。
 - 程序的版本号在编译时由 `release.yml` 注入（等于 Release 的 Tag）；本地直接编译得到的版本号是 `dev`。
 
 ## 12. Alpine 与 Armbian 说明

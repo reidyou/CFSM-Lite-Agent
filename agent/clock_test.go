@@ -81,12 +81,12 @@ func TestClockHysteresis(t *testing.T) {
 
 func TestClockRejectsBadSamples(t *testing.T) {
 	c := useClock(t)
-	c.observe(http.Header{}, clockT0, clockT0)                                                                    // 没有 Date
+	c.observe(http.Header{}, clockT0, clockT0) // 没有 Date
 	bad := http.Header{}
 	bad.Set("Date", "not a date")
-	c.observe(bad, clockT0, clockT0)                                                                              // 解析失败
-	c.observe(dateHdr(clockT0.Add(time.Hour)), clockT0, clockT0.Add(6*time.Second))                               // 往返太久
-	c.observe(dateHdr(clockT0.Add(time.Hour)), clockT0.Add(time.Second), clockT0)                                 // 时间倒流
+	c.observe(bad, clockT0, clockT0)                                                // 解析失败
+	c.observe(dateHdr(clockT0.Add(time.Hour)), clockT0, clockT0.Add(6*time.Second)) // 往返太久
+	c.observe(dateHdr(clockT0.Add(time.Hour)), clockT0.Add(time.Second), clockT0)   // 时间倒流
 	if c.have || c.get() != 0 {
 		t.Fatalf("bad samples must be ignored: have=%v applied=%v", c.have, c.get())
 	}

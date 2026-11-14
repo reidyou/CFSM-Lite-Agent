@@ -29,7 +29,7 @@ type config struct {
 	Targets        map[string]string // ct、cu、cm、bd 四个探测目标
 	// Synced 表示这份配置来自服务端（刚收到的，或上次保存在状态文件里的）。默认配置里是 false：
 	// 此时重置日、时区、统计网卡都可能和服务端不一致，不能拿来累计当月流量，否则会把已有的累计误清零。
-	Synced         bool
+	Synced bool
 }
 
 var slotKeys = []string{"ct", "cu", "cm", "bd"}
@@ -54,7 +54,7 @@ func defaultConfig() config {
 		TZName:         defaultTZ,
 		Loc:            loadZone(defaultTZ),
 		ConnMode:       "auto",
-		WSSInterval:    2 * time.Second,
+		WSSInterval:    3 * time.Second,
 		Targets: map[string]string{
 			"ct": "gd-ct-dualstack.ip.zstaticcdn.com",
 			"cu": "gd-cu-dualstack.ip.zstaticcdn.com",
@@ -69,7 +69,7 @@ var (
 	tzRe     = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_+-]*(/[A-Za-z0-9_+-]+){0,2}$`)
 	calIDRe  = regexp.MustCompile(`^[0-9]{1,20}$`)
 	calPerRe = regexp.MustCompile(`^(none|[0-9]{4}-[0-9]{2}-[0-9]{2}(T[0-9]{2}:[0-9]{2})?)$`)
-	ifaceRe  = regexp.MustCompile(`^[A-Za-z0-9._:@,-]{0,128}$`)
+	ifaceRe  = regexp.MustCompile(`^[A-Za-z0-9._:@,*? -]{0,128}$`)
 )
 
 func md5Hex(s string) string {

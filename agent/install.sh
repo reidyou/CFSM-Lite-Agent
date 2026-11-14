@@ -5,7 +5,7 @@
 #   curl -fsSL https://你的域名/install.sh | sh -s -- -i 节点ID -s 上报密钥 -u https://你的域名/update
 #
 # 用法二：直接从 Agent 仓库执行，用环境变量 CFSM_AGENT_REPO 指定发布仓库：
-#   curl -fsSL https://raw.githubusercontent.com/用户名/CFSM-Lite-Agent/main/install.sh | CFSM_AGENT_REPO=用户名/CFSM-Lite-Agent sh -s -- -i 节点ID -s 上报密钥 -u https://你的域名/update
+#   curl -fsSL https://raw.githubusercontent.com/用户名/CFSM-Lite-Agent/main/agent/install.sh | CFSM_AGENT_REPO=用户名/CFSM-Lite-Agent sh -s -- -i 节点ID -s 上报密钥 -u https://你的域名/update
 #
 # 卸载：在上面任意一条命令的 sh -s -- 后面改成 --uninstall
 # 支持 systemd（Debian、Ubuntu、Armbian 等）和 OpenRC（Alpine）。Alpine 会自动补装 curl、ca-certificates、tzdata。

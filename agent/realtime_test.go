@@ -89,7 +89,7 @@ func readClientFrame(r io.Reader) (opcode byte, payload []byte, masked bool, err
 
 func TestParseConfigConnection(t *testing.T) {
 	cur := defaultConfig()
-	if cur.ConnMode != "auto" || cur.WSSInterval != 2*time.Second {
+	if cur.ConnMode != "auto" || cur.WSSInterval != 3*time.Second {
 		t.Fatalf("defaults: %+v", cur)
 	}
 	next, err := parseConfig("report_interval=60&connection_mode=http&wss_report_interval=4", cur)

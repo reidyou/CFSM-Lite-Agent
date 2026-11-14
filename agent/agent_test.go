@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"reflect"
 	"strings"
 	"testing"
@@ -967,12 +968,25 @@ func TestStateAdvanceReappearingInterface(t *testing.T) {
 	}
 	s.advance(two(1000, 8_000_000_000), t0, rule, "")
 	s.advance(map[string]ifCounters{"eth0": {RX: 1100, TX: 1100}}, t0.Add(time.Minute), rule, "") // eth1 这次没读到
-	s.advance(two(1200, 8_000_000_500), t0.Add(2*time.Minute), rule, "")                         // eth1 回来了
+	s.advance(two(1200, 8_000_000_500), t0.Add(2*time.Minute), rule, "")                          // eth1 回来了
 	if s.RX != 200 || s.TX != 200 {
 		t.Fatalf("重新出现的网卡不能产生假流量: RX=%d TX=%d", s.RX, s.TX)
 	}
 	s.advance(two(1300, 8_000_000_700), t0.Add(3*time.Minute), rule, "")
 	if s.RX != 200+100+200 || s.TX != 200+100+200 {
 		t.Fatalf("基线重建后继续累计: RX=%d TX=%d", s.RX, s.TX)
+	}
+}
+
+// 「统计网卡」支持 * ? 通配符和逗号后的空格，下发配置时不能被当成非法值拒绝。
+func TestParseConfigInterfaceWildcard(t *testing.T) {
+	for _, v := range []string{"eth*", "ens?", "eth*, ens3", "eth0,ens3"} {
+		next, err := parseConfig("interface="+url.QueryEscape(v), defaultConfig())
+		if err != nil || next.Interface != v {
+			t.Fatalf("%q: err=%v iface=%q", v, err, next.Interface)
+		}
+	}
+	if _, err := parseConfig("interface="+url.QueryEscape("eth0;rm"), defaultConfig()); err == nil {
+		t.Fatal("含分号的值应被拒绝")
 	}
 }
