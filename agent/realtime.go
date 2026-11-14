@@ -46,6 +46,13 @@ var (
 	// 没有这个检查时，NAT 超时或网络切换造成的「半死连接」要等 TCP 重传放弃（Linux 默认约 15 分钟）才会被发现，
 	// 期间这台节点收不到 activate，看盘时一直只有每分钟一次的刷新。
 	rtDeadAfter = 2*rtKeepalive + 10*time.Second
+
+	// 有人在看（正在高频推送）时用更短的保活周期：此时连接一旦卡死，所有正在看的页面和 Monito 都会一起停住，
+	// 只剩每分钟一次的 HTTP 上报，所以要尽快发现并重连，而不是等上面的 75 到 85 秒。
+	// 服务端对每个 ping 立刻回 pong（自动应答，不会唤醒休眠的推送中心），这里每 10 秒一次，超过 25 秒没有任何数据就判定断开。
+	// 卡死的连接被丢掉后，积压在系统缓冲区里的旧帧也随之丢弃，恢复后看到的是最新数据，而不是一连串飞快重放的旧数据。
+	rtActiveKeepalive = 10 * time.Second
+	rtActiveDeadAfter = 25 * time.Second
 )
 
 // rtJitter 给重连等待加上 ±20% 的随机量。Worker 重新部署时 Durable Object 会断开所有 Agent 的实时连接，
@@ -150,6 +157,7 @@ func realtimeSession(ctx context.Context, s settings, box *cfgBox, st *state, sh
 
 	keepalive := time.NewTicker(rtKeepalive)
 	defer keepalive.Stop()
+	deadAfter := rtDeadAfter
 	modeCheck := time.NewTicker(rtModeCheck)
 	defer modeCheck.Stop()
 
@@ -159,7 +167,11 @@ func realtimeSession(ctx context.Context, s settings, box *cfgBox, st *state, sh
 	interval := box.get().WSSInterval
 	active := false
 	setActive := func(on bool, secs float64) {
+		oldInterval := interval
 		interval = rtInterval(secs, box.get().WSSInterval)
+		if on && active && timer != nil && interval == oldInterval {
+			return // 重复的「激活」（服务端为防止状态丢失会补发）：已经在推送，保持原来的节奏，不重置基线和计时
+		}
 		if timer != nil {
 			timer.Stop()
 			timer = nil
@@ -171,6 +183,12 @@ func realtimeSession(ctx context.Context, s settings, box *cfgBox, st *state, sh
 			timer = time.NewTimer(interval)
 			frameC = timer.C
 		}
+		ka, dead := rtKeepalive, rtDeadAfter
+		if on {
+			ka, dead = min(ka, rtActiveKeepalive), min(dead, rtActiveDeadAfter)
+		}
+		keepalive.Reset(ka)
+		deadAfter = dead
 	}
 	defer func() {
 		if timer != nil {
@@ -185,7 +203,7 @@ func realtimeSession(ctx context.Context, s settings, box *cfgBox, st *state, sh
 		case err := <-rerr:
 			return err
 		case <-keepalive.C:
-			if idle := conn.sinceRecv(); idle > rtDeadAfter {
+			if idle := conn.sinceRecv(); idle > deadAfter {
 				return fmt.Errorf("实时连接已 %s 没有收到任何数据，判定为断开", idle.Round(time.Second))
 			}
 			if err := conn.WriteText("ping"); err != nil {
