@@ -74,8 +74,7 @@ func normalizeTarget(t string) (host, port string, ok bool) {
 
 // resolveHost 解析域名，做法与 komari-agent 的 resolveIP 一致：取系统解析器返回的第一个地址。
 // Go 的解析器会按 RFC 6724 排序：本机有可用的 IPv6 时 IPv6 排在前面，没有时 IPv4 排在前面。
-// 以前这里强行优先 IPv4，在默认目标（*-dualstack 双栈域名）上会和 komari 走不同的网络路径，
-// 延迟和丢包自然对不上。
+// 不要强行优先 IPv4：在默认目标（*-dualstack 双栈域名）上会和 komari 走不同的网络路径，延迟和丢包就对不上了。
 func resolveHost(ctx context.Context, host string) (string, bool) {
 	if ip := net.ParseIP(host); ip != nil {
 		return ip.String(), true

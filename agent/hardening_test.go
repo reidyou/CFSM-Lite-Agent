@@ -269,7 +269,7 @@ func TestRtJitterRange(t *testing.T) {
 	}
 }
 
-// 回归保护：rtJitter 曾经只有定义和单元测试、生产代码里没有任何地方调用，重连等待实际没有随机量。
+// 回归保护：重连等待必须带随机量（避免服务端重新部署后所有节点同一时刻重连），光有 rtJitter 的定义和单元测试不够。
 // 这里直接检查 runRealtime 的源码里确实把等待时间交给了 rtJitter。
 func TestRealtimeRetryAppliesJitter(t *testing.T) {
 	src, err := os.ReadFile("realtime.go")

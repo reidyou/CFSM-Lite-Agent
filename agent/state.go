@@ -52,7 +52,7 @@ func readStateFile(path string) (st *state, missing bool, err error) {
 }
 
 // loadState 读取状态文件。主文件损坏（断电留下的空文件或截断文件）时：记一条日志，先尝试 .bak（最多落后约 10 分钟的流量），
-// 都不行才从空状态开始，并把坏文件改名为 .corrupt 留作排查。以前这里是静默清零，当月流量丢了也没有任何痕迹。
+// 都不行才从空状态开始，并把坏文件改名为 .corrupt 留作排查；每一步都会在日志里说明，不会静默清零。
 func loadState(path string) *state {
 	if path == "" {
 		return &state{}
@@ -201,8 +201,8 @@ func saveLoop(ctx context.Context, s *state, path string, every time.Duration) {
 }
 
 // delta 计算两次读数之间的增量。当前值小于上次说明计数器被重置（重启、网卡重建）或读数异常，这一段按 0 处理、只重建基线，
-// 和 Komari Agent 的 safeDelta 一致。曾经把「整个当前值」当作新增量，计数器每被重置一次（尤其是网卡重建、读数抖动）就会凭空多出
-// 一整个计数器的流量，这是当月流量偏大的主要来源。代价只是丢掉重置到下一次读数之间的那一小段真实流量，宁可略少、不能虚高。
+// 和 Komari Agent 的 safeDelta 一致。不能把「整个当前值」当作新增量：计数器每被重置一次（尤其是网卡重建、读数抖动）就会凭空多出
+// 一整个计数器的流量，当月流量会因此虚高。代价只是丢掉重置到下一次读数之间的那一小段真实流量，宁可略少、不能虚高。
 func delta(cur, last uint64) uint64 {
 	if cur >= last {
 		return cur - last
