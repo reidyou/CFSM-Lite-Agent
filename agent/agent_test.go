@@ -334,32 +334,83 @@ func TestSummarize(t *testing.T) {
 	ok := func(secAgo int, ms float64) pingSample { return pingSample{at: at(secAgo), ms: ms, ok: true} }
 	bad := func(secAgo int) pingSample { return pingSample{at: at(secAgo)} }
 
-	if _, _, has := summarize(nil, now); has {
+	// 窗口内没有样本（没有样本，或者样本都在 100 分钟之前）：ok 为 false
+	if _, has := summarize(nil, now); has {
 		t.Fatal("no samples must report ok=false")
 	}
-	// 10 个样本里 2 个失败：丢包 20%（1 小时窗口）；最近 10 分钟内的成功样本取平均值（210+190+200+205+195 = 1000，共 5 个）
-	samples := []pingSample{ok(2000, 900), bad(1500), ok(1000, 800), ok(900, 700), bad(800), ok(50, 210), ok(40, 190), ok(30, 200), ok(20, 205), ok(10, 195)}
-	lat, loss, has := summarize(samples, now)
-	if !has || loss != 20 || lat != 200.0 {
-		t.Fatalf("lat=%v loss=%v ok=%v", lat, loss, has)
+	if _, has := summarize([]pingSample{bad(7000)}, now); has {
+		t.Fatal("only samples outside the window must report ok=false")
 	}
+
+	// 基本统计。最右桶（最近 5 分钟）5 个成功样本：平均 (210+190+200+205+195)/5 = 200；
+	// 第 17 桶（10 到 15 分钟前）3 个样本、1 个失败：平均 750、丢包 33.3；第 15 桶只有 1 个样本：没有数据。
+	// 丢包数字用整个窗口的计数：9 个样本 2 个失败。
+	samples := []pingSample{bad(1500), ok(890, 700), ok(880, 800), bad(870), ok(50, 210), ok(40, 190), ok(30, 200), ok(20, 205), ok(10, 195)}
+	sum, has := summarize(samples, now)
+	if !has || len(sum.lat) != pingBuckets || len(sum.los) != pingBuckets {
+		t.Fatalf("unexpected summary: %+v ok=%v", sum, has)
+	}
+	if sum.latency != 200.0 || sum.loss != round1(200.0/9) {
+		t.Fatalf("latency=%v loss=%v", sum.latency, sum.loss)
+	}
+	if sum.lat[19] != 200.0 || sum.los[19] != 0.0 {
+		t.Fatalf("last bucket: lat=%v loss=%v", sum.lat[19], sum.los[19])
+	}
+	if sum.lat[17] != 750.0 || sum.los[17] != round1(100.0/3) {
+		t.Fatalf("bucket 17: lat=%v loss=%v", sum.lat[17], sum.los[17])
+	}
+	if sum.lat[15] != false || sum.los[15] != false || sum.lat[0] != false || sum.los[0] != false {
+		t.Fatalf("sparse buckets must have no data: lat15=%v loss15=%v lat0=%v loss0=%v", sum.lat[15], sum.los[15], sum.lat[0], sum.los[0])
+	}
+	// 延迟数字就是最右桶的值：数字和色块一致
+	if sum.latency != sum.lat[19] {
+		t.Fatalf("latency number %v must equal the last bucket %v", sum.latency, sum.lat[19])
+	}
+
 	// 平均值：与 komari 面板一致，异常高的样本会拉高平均值
-	lat, _, _ = summarize([]pingSample{ok(30, 100), ok(20, 200), ok(10, 600)}, now)
-	if lat != 300.0 {
-		t.Fatalf("mean = %v", lat)
+	sum, _ = summarize([]pingSample{ok(30, 100), ok(20, 200), ok(10, 600)}, now)
+	if sum.latency != 300.0 || sum.loss != 0.0 {
+		t.Fatalf("mean = %v loss = %v", sum.latency, sum.loss)
 	}
-	// 最近 10 分钟全部失败：延迟为 nil（超时），丢包率仍按 1 小时窗口算
-	lat, loss, _ = summarize([]pingSample{ok(1300, 100), ok(1200, 100), bad(30), bad(20), bad(10), bad(5)}, now)
-	if lat != nil || loss != round1(400.0/6) {
-		t.Fatalf("lat=%v loss=%v", lat, loss)
+
+	// 刚落在 now 上的样本算进最右桶
+	sum, _ = summarize([]pingSample{ok(0, 10)}, now)
+	if sum.latency != 10.0 {
+		t.Fatalf("sample at now must land in the last bucket: %v", sum.latency)
+	}
+
+	// 样本太少：延迟照常显示（最右桶有 1 个样本就算），丢包数字不给（false）
+	sum, _ = summarize([]pingSample{ok(10, 50)}, now)
+	if sum.latency != 50.0 || sum.loss != false {
+		t.Fatalf("few samples: latency=%v loss=%v", sum.latency, sum.loss)
 	}
 	// 窗口外的样本不计入
-	lat, loss, has = summarize([]pingSample{bad(4000), ok(10, 50)}, now)
-	if !has || loss != 0 || lat != 50.0 {
-		t.Fatalf("old samples counted: lat=%v loss=%v", lat, loss)
+	sum, _ = summarize([]pingSample{bad(7000), ok(10, 50)}, now)
+	if sum.latency != 50.0 || sum.loss != false {
+		t.Fatalf("old samples counted: latency=%v loss=%v", sum.latency, sum.loss)
 	}
-	if _, _, has := summarize([]pingSample{bad(4000)}, now); has {
-		t.Fatal("only samples outside the window must report ok=false")
+
+	// 最右桶全部失败：延迟 nil（超时），丢包 100
+	sum, _ = summarize([]pingSample{bad(30), bad(20), bad(10), bad(5)}, now)
+	if sum.latency != nil || sum.lat[19] != nil || sum.los[19] != 100.0 || sum.loss != 100.0 {
+		t.Fatalf("all failed: latency=%v lat=%v loss=%v total=%v", sum.latency, sum.lat[19], sum.los[19], sum.loss)
+	}
+
+	// 彻底断线：最近连续 3 次探测都失败时，哪怕最右桶里还有旧的成功样本，延迟数字和最右桶也立即变成超时；
+	// 最右桶的丢包仍是真实的失败占比（8 个样本、3 个失败），丢包数字按整个窗口算
+	sum, _ = summarize([]pingSample{ok(250, 100), ok(200, 100), ok(150, 100), ok(100, 100), ok(60, 100), bad(30), bad(20), bad(10)}, now)
+	if sum.latency != nil || sum.lat[19] != nil || sum.los[19] != 37.5 || sum.loss != 37.5 {
+		t.Fatalf("down run: latency=%v lat=%v loss=%v total=%v", sum.latency, sum.lat[19], sum.los[19], sum.loss)
+	}
+	// 只连续失败 2 次不算断线：延迟仍是成功样本的平均值
+	sum, _ = summarize([]pingSample{ok(30, 100), bad(20), bad(10)}, now)
+	if sum.latency != 100.0 {
+		t.Fatalf("two failures are not a down run: latency=%v", sum.latency)
+	}
+	// 断线之后又恢复：最近 3 次里有成功的，不再算断线
+	sum, _ = summarize([]pingSample{ok(100, 100), bad(30), bad(20), ok(10, 120)}, now)
+	if sum.latency != 110.0 {
+		t.Fatalf("recovered: latency=%v", sum.latency)
 	}
 }
 
@@ -383,6 +434,9 @@ func TestPingerPublish(t *testing.T) {
 	if m["ping_cu"] != false || m["loss_cu"] != false {
 		t.Fatalf("unconfigured slot must be false: %+v", m)
 	}
+	if _, has := m["hist_cu"]; has {
+		t.Fatalf("unconfigured slot must not report history: %+v", m)
+	}
 	if _, has := m["ping_ct"]; has || pingReady(m, cfg) {
 		t.Fatalf("configured slot without samples must be missing and not ready: %+v", m)
 	}
@@ -400,11 +454,27 @@ func TestPingerPublish(t *testing.T) {
 	if m["ping_ct"] != 200.0 || m["loss_ct"] != 25.0 || !pingReady(m, cfg) {
 		t.Fatalf("unexpected: %+v", m)
 	}
+	// 历史：步长 300 秒，延迟和丢包各 20 个色块，最右边的色块和数字一致
+	hist, isMap := m["hist_ct"].(map[string]any)
+	if !isMap {
+		t.Fatalf("hist_ct missing or wrong type: %+v", m)
+	}
+	hp, _ := hist["p"].([]any)
+	hl, _ := hist["l"].([]any)
+	if hist["s"] != 300 || len(hp) != pingBuckets || len(hl) != pingBuckets {
+		t.Fatalf("unexpected history: %+v", hist)
+	}
+	if hp[pingBuckets-1] != m["ping_ct"] || hl[pingBuckets-1] != 25.0 {
+		t.Fatalf("last bucket must match the numbers: p=%v l=%v", hp[pingBuckets-1], hl[pingBuckets-1])
+	}
 	// 目标改了：旧样本清掉，要重新等第一个样本
 	p.setTarget("ct", "b.example:443")
 	m = sh.getPing()
 	if _, has := m["ping_ct"]; has {
 		t.Fatalf("old samples must be cleared when the target changes: %+v", m)
+	}
+	if _, has := m["hist_ct"]; has {
+		t.Fatalf("old history must be cleared when the target changes: %+v", m)
 	}
 	// 目标被清空：变成未配置
 	p.setTarget("ct", "")
@@ -413,6 +483,8 @@ func TestPingerPublish(t *testing.T) {
 	}
 	// 窗口内全部失败：延迟为 nil，丢包 100
 	p.setTarget("ct", "a.example:80")
+	p.record("ct", "a.example:80", now.Add(-20*time.Second), 0, false)
+	p.record("ct", "a.example:80", now.Add(-10*time.Second), 0, false)
 	p.record("ct", "a.example:80", now, 0, false)
 	m = sh.getPing()
 	if v, has := m["ping_ct"]; !has || v != nil || m["loss_ct"] != 100.0 {
@@ -431,8 +503,8 @@ func TestPingerKeepsBoundedSamples(t *testing.T) {
 	if n := len(p.hist["ct"].samples); n != pingMaxSamples {
 		t.Fatalf("samples = %d, want %d", n, pingMaxSamples)
 	}
-	// 超过丢包窗口的样本会被清掉
-	later := now.Add(pingLossWindow + time.Minute)
+	// 超过统计窗口（100 分钟）的样本会被清掉
+	later := now.Add(pingHistWindow + time.Minute)
 	p.now = func() time.Time { return later }
 	p.record("ct", "a.example:80", later, time.Millisecond, true)
 	if n := len(p.hist["ct"].samples); n != 1 {

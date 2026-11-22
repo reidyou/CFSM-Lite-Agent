@@ -15,16 +15,23 @@ import (
 // 失败记为丢包；握手耗时超过 1 秒时重测，疑似 SYN 重传的样本也记为丢包（见 measureSample）。
 // 域名解析也与 komari 一致：取系统解析器返回的第一个地址，不再强行优先 IPv4（见 resolveHost）。
 // 丢包率不是在一次探测里算，而是在一段时间的大量样本上统计：komari 由面板统计，
-// Lite 的服务端只保存最新值，所以样本留在 Agent 里，按滑动窗口统计后随指标上报。
+// Lite 的服务端只保存最新值，所以样本留在 Agent 里，上报时现算。
 // 统计口径同样与 komari 面板一致：丢包率 = 失败样本数 ÷ 总样本数，延迟 = 成功样本的平均值。
+// 每次上报以当前时刻为终点往前切 20 个 5 分钟的桶：页面上的色块就是这 20 个桶，
+// 延迟数字 = 最右边那个桶的平均值，丢包数字 = 20 个桶合计的失败占比，数字和色块出自同一次计算，必然一致。
 const (
 	pingTimeout        = 3 * time.Second  // 单次连接超时
 	pingResolveTimeout = 10 * time.Second // 域名解析超时（komari 解析没有单独的超时，这里只防止卡死）
 	pingInterval       = 10 * time.Second // 每个目标的采样间隔
-	pingLossWindow     = time.Hour        // 丢包率统计窗口（komari 面板按小时级窗口统计，10 分钟只有 60 个样本，波动太大）
-	pingLatencyWindow  = 10 * time.Minute // 延迟（取平均值）统计窗口
-	pingMaxSamples     = 400              // 每个目标最多保留的样本数（1 小时 + 余量）
+	pingBucket         = 5 * time.Minute  // 一个色块覆盖的时间；延迟数字就是最右边（最近）一个色块的平均值
+	pingBuckets        = 20               // 色块个数；20 × 5 分钟 = 100 分钟，丢包数字统计整个窗口
+	pingHistWindow     = pingBucket * pingBuckets
+	pingMaxSamples     = 620              // 每个目标最多保留的样本数（100 分钟 ÷ 10 秒 = 600，加余量）
 	pingFirstWait      = 15 * time.Second // 第一次上报前最多等多久，让每个目标至少有一个样本
+
+	pingMinBucket = 3 // 一个色块（最右边的除外）样本数少于这个值就当作没有数据：只有刚启动时最左边的色块才会这样
+	pingMinLoss   = 3 // 窗口内样本数少于这个值时不给丢包数字（显示 —），避免两三个样本算出 33%、100% 这样的误导数字
+	pingDownRun   = 3 // 最近连续这么多次探测全部失败（约 30 秒），延迟数字立即变成超时，不等 5 分钟窗口里的旧成功样本过期
 
 	pingHighMs    = 1000 // 耗时超过这个值（毫秒）就重测
 	pingRetries   = 3    // 重测次数上限
@@ -196,7 +203,7 @@ func (p *pinger) record(slot, target string, at time.Time, d time.Duration, ok b
 		}
 	}
 	h.samples = append(h.samples, s)
-	cut := at.Add(-pingLossWindow)
+	cut := at.Add(-pingHistWindow)
 	drop := 0
 	for drop < len(h.samples) && h.samples[drop].at.Before(cut) {
 		drop++
@@ -210,8 +217,9 @@ func (p *pinger) record(slot, target string, at time.Time, d time.Duration, ok b
 	p.sh.setPing(out)
 }
 
-// buildLocked 生成要上报的 ping_* 和 loss_*（调用时必须持有 p.mu）。结果的约定与 Worker 一致：
-// ping_* 为数字（毫秒）、null（窗口内全部失败）、false（未配置）；loss_* 为丢包百分比。
+// buildLocked 生成要上报的 ping_*、loss_* 和 hist_*（调用时必须持有 p.mu）。结果的约定与 Worker 一致：
+// ping_* 为数字（毫秒）、null（最近 5 分钟全部失败，或最近连续几次探测都失败）、false（未配置）；
+// loss_* 为丢包百分比，样本太少时为 false；hist_* 是 20 个色块的历史（见 summarize）。
 // 已配置但还没有样本的槽位不放进结果，由 pingReady 判断是否还在等第一个样本。
 func (p *pinger) buildLocked() map[string]any {
 	now := p.now()
@@ -226,43 +234,112 @@ func (p *pinger) buildLocked() map[string]any {
 		if h == nil {
 			continue
 		}
-		if lat, loss, ok := summarize(h.samples, now); ok {
-			out["ping_"+k] = lat
-			out["loss_"+k] = loss
+		if sum, ok := summarize(h.samples, now); ok {
+			out["ping_"+k] = sum.latency
+			out["loss_"+k] = sum.loss
+			out["hist_"+k] = map[string]any{"s": int(pingBucket / time.Second), "p": sum.lat, "l": sum.los}
 		}
 	}
 	return out
 }
 
-// summarize 统计一个目标的样本：丢包率 = 丢包窗口内失败数 ÷ 总数；
-// 延迟 = 延迟窗口内成功样本的平均值（komari 面板的延迟统计也是平均值），窗口内没有成功样本时为 nil（超时）。
-// 丢包窗口内没有任何样本时 ok 为 false。
-func summarize(samples []pingSample, now time.Time) (latency any, loss float64, ok bool) {
-	lossCut := now.Add(-pingLossWindow)
-	latCut := now.Add(-pingLatencyWindow)
+// bucketStat 是一个 5 分钟桶里的样本统计。
+type bucketStat struct {
+	n      int     // 样本总数
+	failed int     // 失败数
+	okN    int     // 成功数
+	sum    float64 // 成功样本的耗时之和（毫秒）
+}
+
+// pingSummary 是一个目标统计后的全部结果：数字和色块来自同一批样本、同一次计算。
+type pingSummary struct {
+	latency any   // 延迟数字：float64（毫秒）或 nil（超时）
+	loss    any   // 丢包数字：float64（百分比）或 false（样本太少）
+	lat     []any // 20 个色块的延迟：float64、nil（这个桶全部失败）、false（没有数据），从旧到新
+	los     []any // 20 个色块的丢包：float64（百分比）、false（没有数据），从旧到新
+}
+
+// summarize 以 now 为终点，把最近 100 分钟的样本切成 20 个 5 分钟的桶（桶 i 覆盖 [start+i×5分钟, start+(i+1)×5分钟)，
+// 刚好落在 now 上的样本算进最后一个桶），再统计：
+//   - 每个桶：延迟 = 成功样本的平均值（全部失败为 nil），丢包 = 失败数 ÷ 样本数；
+//     样本数少于 pingMinBucket 的桶没有数据（最右边的桶只要有 1 个样本就算，刚启动时数字和色块才对得上）。
+//   - 延迟数字 = 最右边桶的延迟。最近连续 pingDownRun 次探测全部失败时，数字和最右桶的延迟都直接记为 nil，
+//     这是为了让彻底断线能马上显示出来；此时最右桶的丢包仍是它真实的失败占比。
+//   - 丢包数字 = 整个窗口的失败数 ÷ 总数（用计数合并，不是把各桶的百分比再平均）；样本少于 pingMinLoss 时为 false。
+//
+// 窗口内一个样本也没有时 ok 为 false。
+func summarize(samples []pingSample, now time.Time) (sum pingSummary, ok bool) {
+	var st [pingBuckets]bucketStat
+	start := now.Add(-pingHistWindow)
 	total, failed := 0, 0
-	var sum float64
-	nOK := 0
 	for _, s := range samples {
-		if s.at.Before(lossCut) {
+		if s.at.Before(start) {
 			continue
 		}
+		i := int(s.at.Sub(start) / pingBucket)
+		if i >= pingBuckets {
+			i = pingBuckets - 1
+		}
+		b := &st[i]
+		b.n++
 		total++
-		if !s.ok {
+		if s.ok {
+			b.okN++
+			b.sum += s.ms
+		} else {
+			b.failed++
 			failed++
-		} else if !s.at.Before(latCut) {
-			sum += s.ms
-			nOK++
 		}
 	}
 	if total == 0 {
-		return nil, 0, false
+		return pingSummary{}, false
 	}
-	loss = round1(float64(failed) * 100 / float64(total))
-	if nOK == 0 {
-		return nil, loss, true
+
+	// 样本按时间先后追加：从末尾倒着看最近 pingDownRun 个，窗口内凑不够，或者其中有成功的，都不算断线
+	down, seen := true, 0
+	for i := len(samples) - 1; i >= 0 && seen < pingDownRun; i-- {
+		if samples[i].at.Before(start) {
+			break
+		}
+		seen++
+		if samples[i].ok {
+			down = false
+			break
+		}
 	}
-	return round1(sum / float64(nOK)), loss, true
+	down = down && seen == pingDownRun
+
+	sum.lat = make([]any, pingBuckets)
+	sum.los = make([]any, pingBuckets)
+	for i, b := range st {
+		need := pingMinBucket
+		if i == pingBuckets-1 {
+			need = 1
+		}
+		if b.n < need {
+			sum.lat[i], sum.los[i] = false, false
+			continue
+		}
+		sum.los[i] = round1(float64(b.failed) * 100 / float64(b.n))
+		if b.okN == 0 {
+			sum.lat[i] = nil
+		} else {
+			sum.lat[i] = round1(b.sum / float64(b.okN))
+		}
+	}
+	if down {
+		sum.lat[pingBuckets-1] = nil
+	}
+	sum.latency = sum.lat[pingBuckets-1]
+	if sum.latency == false {
+		sum.latency = nil // 最右桶没有样本（探测卡住了很久）：按超时处理
+	}
+	if total >= pingMinLoss {
+		sum.loss = round1(float64(failed) * 100 / float64(total))
+	} else {
+		sum.loss = false
+	}
+	return sum, true
 }
 
 // run 为四个槽位各起一个协程，持续采样直到 ctx 结束。
