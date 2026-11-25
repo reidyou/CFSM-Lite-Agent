@@ -203,6 +203,11 @@ func buildMetrics(a, b snapshot, cfg config, st *state, heavy, ping map[string]a
 		"net_in_speed":   ratePerSec(b.rx, a.rx, secs),
 		"net_out_speed":  ratePerSec(b.tx, a.tx, secs),
 	}
+	if cfg.Podman { // 只有服务端打开了这个节点的开关才统计；数不出来（不是 cgroup v2 等）时不上报这个字段
+		if n, ok := countPodmanAt(cgroupRoot); ok {
+			m["podman_count"] = n
+		}
+	}
 	for key, v := range heavy {
 		m[key] = v
 	}

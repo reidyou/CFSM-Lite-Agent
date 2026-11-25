@@ -27,6 +27,7 @@ type config struct {
 	ConnMode       string            // auto：有人在看时实时推送，其余时间 HTTP POST；http：只用 HTTP POST
 	WSSInterval    time.Duration     // 实时推送的间隔（1 到 5 秒）；实际以服务端通知的为准
 	Targets        map[string]string // ct、cu、cm、bd 四个探测目标
+	Podman         bool              // 是否统计并上报运行中的 podman 容器数量（服务端按节点开关下发，默认关闭）
 	// Synced 表示这份配置来自服务端（刚收到的，或上次保存在状态文件里的）。默认配置里是 false：
 	// 此时重置日、时区、统计网卡都可能和服务端不一致，不能拿来累计当月流量，否则会把已有的累计误清零。
 	Synced bool
@@ -79,7 +80,7 @@ func md5Hex(s string) string {
 
 // parseConfig 解析 Worker 下发的 QueryParam 配置串（例如 report_interval=60&reset_day=1&...）。
 // 只认下面列出的键：report_interval、reset_day、reset_hour、reset_minute、timezone、cal_*（流量校准）、interface、
-// connection_mode、wss_report_interval 和 custom_*（Ping 目标）；其余（schema_version 等）一律忽略。Ping 固定用 TCP，不需要配置。
+// connection_mode、wss_report_interval、podman 和 custom_*（Ping 目标）；其余（schema_version 等）一律忽略。Ping 固定用 TCP，不需要配置。
 // 任何一项不合法就整体拒绝并保持当前配置，避免半套用。
 func parseConfig(body string, cur config) (config, error) {
 	body = strings.TrimSpace(body)
@@ -163,6 +164,17 @@ func parseConfig(body string, cur config) (config, error) {
 			return cur, fmt.Errorf("wss_report_interval 无效: %q", v)
 		}
 		next.WSSInterval = time.Duration(n) * time.Second
+	}
+	// podman：每次下发都以服务端为准，没有这个键就是关闭
+	next.Podman = false
+	if q.Has("podman") {
+		switch q.Get("podman") {
+		case "1":
+			next.Podman = true
+		case "0":
+		default:
+			return cur, fmt.Errorf("podman 无效: %q", q.Get("podman"))
+		}
 	}
 	for _, k := range slotKeys {
 		if v := q.Get("custom_" + k); v != "" {
